@@ -22,7 +22,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear serves `linear_graphql`, GitHub serves three constrained pilot tools, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
@@ -248,19 +248,37 @@ codex:
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
 
-### GitHub Issues adapter
+### GitHub Issues + Projects v2 adapter (compact pilot profile)
 
-- Config: use `tracker.kind: github` with required `tracker.provider.repo` in `owner/repo` form,
-  optional `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`), and optional `api_url`
-  (default `https://api.github.com`, HTTPS only). Set explicit `active_states` and
-  `terminal_states`; active entries may be `open` and terminal entries may be `closed`.
-- Reads and identity: polling is scoped to the configured repository; `issue.id` is the
-  repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
-  omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
-- Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
-  `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
-  credentials and provider authentication aliases from the Codex child, and leaves raw tool access
-  limited by that token's GitHub permissions.
+The GitHub adapter is intentionally fail closed and supports exactly one GitHub.com repository and
+one Project v2. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete profile.
+
+- Required stable scope: `repo`, `repository_id`, and `project_id`. Symphony never discovers or
+  substitutes these identifiers and never falls back to `GITHUB_REPO`.
+- Required workflow metadata: `ready_label`, `status_field_id`, explicit `status_options`,
+  `ready_statuses`, `priority_field_id`, explicit integer `priority_options`, `workflow_labels`, and
+  the authenticated comment owner's `actor_id`. Missing, duplicate, or unknown fields/options fail
+  the entire read. Priority is deliberately required by this compact profile.
+- Auth: `token` is required and may be a `$VAR_NAME` host-side reference. The example uses
+  `$SYMPHONY_GITHUB_TOKEN`. Token values are removed from the Codex child environment and are not
+  included in prompts, logs, or tool results. Grant only repository metadata/issue read access,
+  Project read access, and issue comment/label write access.
+- Eligibility: only open Issue content in the exact configured repository and Project can dispatch.
+  Pull requests are skipped; draft/redacted items, incomplete nested pagination, ambiguous Project
+  membership, missing dependency data, unknown fields, and open blockers fail closed or make the
+  issue non-dispatchable. `issue.id` is the Project item node ID; issue, repository, Project, and
+  Project-item node IDs remain in `native_ref`.
+- Reliability: Project reads use cursor pagination with `max_pages` (default 20, maximum 100),
+  `timeout_ms` (default 30000), strict cursor checks, and explicit permission/rate-limit errors.
+- Mutations: Codex receives only `github_workpad`, `github_apply_workflow_label`, and
+  `github_attach_draft_pr`. They can upsert one marker-owned workpad comment, apply one configured
+  allowlisted label, and verify/attach a Draft PR URL in the configured repository. There is no raw
+  REST/GraphQL tool and no delete, repository administration, branch protection, merge, or Project
+  mutation capability.
+
+The adapter assumes GitHub's `Issue.blockedBy` GraphQL connection is available to the token and
+fully readable. A complete labels, blockers, field-values, and single-assignee result must fit the
+documented nested bounds; otherwise polling fails instead of inferring eligibility.
 
 ### Jira Cloud adapter
 
@@ -346,14 +364,9 @@ The live test creates a temporary Linear project and issue, writes a temporary `
 a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
-Run the opt-in GitHub Issues live test with a disposable/scratch repository:
-
-```bash
-cd elixir
-export SYMPHONY_LIVE_GITHUB_REPO=owner/scratch-repo
-export GITHUB_TOKEN=...
-SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mix test test/symphony_elixir/github_live_e2e_test.exs
-```
+The former generic GitHub Issues live test does not apply to the compact Projects v2 pilot profile.
+Pilot validation should use a dedicated repository and Project populated with the exact node and
+field identifiers documented in `WORKFLOW.github.md`.
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
 create, comment on, transition, and delete issues:
