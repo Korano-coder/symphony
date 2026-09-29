@@ -5,6 +5,7 @@ tracker:
     repo: "Korano-coder/Renewable-Fuels-Trading-Intelligence"
     repository_id: "REPLACE_WITH_REPOSITORY_NODE_ID"
     project_id: "REPLACE_WITH_PROJECT_V2_NODE_ID"
+    base_branch: "staging"
     token: "$SYMPHONY_GITHUB_TOKEN"
     ready_label: "symphony:ready"
     status_field_id: "REPLACE_WITH_STATUS_FIELD_NODE_ID"
@@ -35,6 +36,8 @@ workspace:
   root: "~/symphony_workspaces"
 hooks:
   after_create: |
+    # HARD PREREQUISITE: this SSH credential may push feature branches only;
+    # GitHub rulesets must reject direct pushes to main and staging.
     git clone --branch staging --single-branch git@github.com:Korano-coder/Renewable-Fuels-Trading-Intelligence.git .
     test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/staging | cut -f1)"
 ---

@@ -73,5 +73,6 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   defp validate_ready_label(_settings), do: {:error, :missing_github_ready_label_gate}
 
-  defp normalize_state(state), do: state |> String.trim() |> String.downcase()
+  defp normalize_state(state) when is_binary(state), do: state |> String.trim() |> String.downcase()
+  defp normalize_state(_state), do: ""
 end

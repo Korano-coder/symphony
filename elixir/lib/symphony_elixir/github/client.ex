@@ -65,22 +65,26 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states([]), do: {:ok, []}
+
   def fetch_issues_by_states(states) when is_list(states),
     do: fetch(states, nil, Config.settings!().tracker, &graphql_request/3)
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids([]), do: {:ok, []}
+
   def fetch_issues_by_ids(ids) when is_list(ids),
     do: fetch([], MapSet.new(ids), Config.settings!().tracker, &graphql_request/3)
 
-  @spec issue_in_scope?(pos_integer(), keyword()) :: :ok | {:error, term()}
-  def issue_in_scope?(number, opts \\ []) when is_integer(number) and number > 0 do
+  @spec issue_in_scope?(map(), keyword()) :: :ok | {:error, term()}
+  def issue_in_scope?(native_ref, opts \\ []) when is_map(native_ref) do
     tracker = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
     request_fun = Keyword.get(opts, :graphql_fun, &graphql_request/3)
 
     with {:ok, settings} <- parse_settings(tracker),
          {:ok, issues} <- fetch(Map.values(settings.status_options), nil, tracker, request_fun),
          true <-
-           Enum.any?(issues, &(get_in(&1.native_ref, ["issue_number"]) == number)) or
+           Enum.any?(issues, &(&1.native_ref == native_ref)) or
              {:error, :github_issue_out_of_scope} do
       :ok
     end
@@ -104,7 +108,18 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp fetch(states, ids, tracker, request_fun) do
+  defp fetch([], nil, _tracker, _request_fun), do: {:ok, []}
+
+  defp fetch(states, %MapSet{} = ids, tracker, request_fun) do
+    if MapSet.size(ids) == 0,
+      do: {:ok, []},
+      else: fetch_nonempty(states, ids, tracker, request_fun)
+  end
+
+  defp fetch(states, nil, tracker, request_fun),
+    do: fetch_nonempty(states, nil, tracker, request_fun)
+
+  defp fetch_nonempty(states, ids, tracker, request_fun) do
     with {:ok, settings} <- parse_settings(tracker) do
       fetch_page(settings, MapSet.new(states, &normalize/1), ids, nil, 1, request_fun, [], MapSet.new())
     end
@@ -204,7 +219,7 @@ defmodule SymphonyElixir.GitHub.Client do
          {:ok, created_at} <- datetime(issue["createdAt"]),
          {:ok, updated_at} <- datetime(issue["updatedAt"]) do
       blocked = Enum.any?(blockers, &(&1["state"] != "closed"))
-      ready = settings.ready_label in labels and MapSet.member?(settings.ready_statuses, status)
+      ready = settings.ready_label in labels and MapSet.member?(settings.ready_statuses, normalize(status))
 
       {:ok,
        %Issue{
@@ -368,12 +383,13 @@ defmodule SymphonyElixir.GitHub.Client do
     with {:ok, repo} <- repo(value["repo"]),
          {:ok, repository_id} <- id(value["repository_id"], :missing_github_repository_id),
          {:ok, project_id} <- id(value["project_id"], :missing_github_project_id),
+         {:ok, base_branch} <- branch(value["base_branch"]),
          {:ok, ready_label} <- label(value["ready_label"]),
          {:ok, status_field_id} <- id(value["status_field_id"], :missing_github_status_field_id),
          {:ok, status_options} <- string_map(value["status_options"], :invalid_github_status_options),
          {:ok, ready_statuses} <- string_set(value["ready_statuses"], :invalid_github_ready_statuses),
          true <-
-           Enum.all?(ready_statuses, &(&1 in Map.values(status_options))) or
+           Enum.all?(ready_statuses, &(&1 in Enum.map(Map.values(status_options), fn name -> normalize(name) end))) or
              {:error, :invalid_github_ready_statuses},
          {:ok, priority_field_id} <- id(value["priority_field_id"], :missing_github_priority_field_id),
          {:ok, priority_options} <- integer_map(value["priority_options"]),
@@ -387,6 +403,7 @@ defmodule SymphonyElixir.GitHub.Client do
          repo: repo,
          repository_id: repository_id,
          project_id: project_id,
+         base_branch: base_branch,
          ready_label: normalize(ready_label),
          status_field_id: status_field_id,
          status_options: status_options,
@@ -416,13 +433,21 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp repo(_), do: {:error, :missing_github_repo}
+  defp branch(value) when is_binary(value), do: if(present?(value), do: {:ok, String.trim(value)}, else: {:error, :invalid_github_base_branch})
+  defp branch(_), do: {:error, :missing_github_base_branch}
   defp id(value, error) when is_binary(value), do: if(present?(value), do: {:ok, String.trim(value)}, else: {:error, error})
   defp id(_, error), do: {:error, error}
   defp label(value) when is_binary(value), do: if(present?(value), do: {:ok, value}, else: {:error, :invalid_github_ready_label})
   defp label(_), do: {:error, :missing_github_ready_label}
 
   defp string_map(value, error) when is_map(value) and map_size(value) > 0 do
-    if Enum.all?(value, fn {key, item} -> present?(key) and present?(item) end), do: {:ok, value}, else: {:error, error}
+    entries = Enum.map(value, fn {key, item} -> {key, if(is_binary(item), do: String.trim(item))} end)
+    normalized_values = Enum.map(entries, fn {_key, item} -> normalize(item) end)
+
+    if Enum.all?(entries, fn {key, item} -> present?(key) and present?(item) end) and
+         Enum.uniq(normalized_values) == normalized_values,
+       do: {:ok, Map.new(entries)},
+       else: {:error, error}
   end
 
   defp string_map(_, error), do: {:error, error}
@@ -434,7 +459,11 @@ defmodule SymphonyElixir.GitHub.Client do
   defp integer_map(_), do: {:error, :invalid_github_priority_options}
 
   defp string_set(value, error) when is_list(value) and value != [] do
-    if Enum.all?(value, &present?/1), do: {:ok, MapSet.new(value, &String.trim/1)}, else: {:error, error}
+    normalized = Enum.map(value, &normalize/1)
+
+    if Enum.all?(value, &present?/1) and Enum.uniq(normalized) == normalized,
+      do: {:ok, MapSet.new(normalized)},
+      else: {:error, error}
   end
 
   defp string_set(_, error), do: {:error, error}

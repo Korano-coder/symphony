@@ -2,6 +2,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.GitHub.{Adapter, AgentTool, Client}
+  alias SymphonyElixir.Tracker.Issue
 
   defmodule FakeClient do
     def fetch_issues_by_states(states), do: {:ok, states}
@@ -35,6 +36,24 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     no_ready_label = %{settings() | provider: Map.delete(settings().provider, "ready_label")}
     assert {:error, :missing_github_ready_label_gate} = Adapter.validate_config(no_ready_label)
+
+    assert {:error, :invalid_github_status_options} =
+             Adapter.validate_config(
+               settings(%{
+                 "status_options" => %{
+                   "one" => " Ready ",
+                   "two" => "ready",
+                   "review" => "Human Review",
+                   "done" => "Done"
+                 }
+               })
+             )
+
+    assert {:error, :invalid_github_workflow_labels} =
+             Adapter.validate_config(settings(%{"workflow_labels" => [" Symphony:Human-Review ", "symphony:human-review"]}))
+
+    assert {:error, :missing_github_ready_label_gate} =
+             Adapter.validate_config(%{settings() | required_labels: [123]})
   end
 
   test "adapter delegates reads and tool execution" do
@@ -127,6 +146,14 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert issue.id == "PVTI_item_42"
   end
 
+  test "empty state and ID reads do not parse settings or call GitHub" do
+    no_request = fn _, _, _ -> flunk("empty reads must not call GitHub") end
+    invalid = %{provider: %{}}
+
+    assert {:ok, []} = Client.fetch_for_test([], nil, invalid, no_request)
+    assert {:ok, []} = Client.fetch_for_test([], [], invalid, no_request)
+  end
+
   test "workpad updates only one marker-owned comment and rejects ambiguous pagination" do
     test_pid = self()
 
@@ -158,13 +185,31 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
       cond do
         path == "/repos/Korano-coder/Renewable-Fuels-Trading-Intelligence/pulls/7" ->
-          {:ok, %{status: 200, body: %{"draft" => true, "html_url" => "https://github.com/Korano-coder/Renewable-Fuels-Trading-Intelligence/pull/7"}}}
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "draft" => true,
+               "state" => "open",
+               "html_url" => "https://github.com/Korano-coder/Renewable-Fuels-Trading-Intelligence/pull/7",
+               "base" => %{
+                 "ref" => "staging",
+                 "repo" => %{"full_name" => "Korano-coder/Renewable-Fuels-Trading-Intelligence"}
+               }
+             }
+           }}
 
         method == "GET" ->
           {:ok, %{status: 200, body: []}}
 
         true ->
-          {:ok, %{status: 201, body: body}}
+          response_body =
+            case body do
+              %{"labels" => [label]} -> %{"labels" => [%{"name" => label}]}
+              %{"body" => _} -> %{"id" => 10}
+            end
+
+          {:ok, %{status: 201, body: response_body}}
       end
     end
 
@@ -177,9 +222,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   end
 
   test "all mutations reject issues outside the configured Project" do
-    denied = fn 42, _ -> {:error, :github_issue_out_of_scope} end
+    denied = fn _native_ref, _ -> {:error, :github_issue_out_of_scope} end
     client = fn _, _, _, _, _ -> flunk("out-of-scope writes must not reach REST") end
-    opts = [tracker_settings: settings(), github_client: client, scope_checker: denied]
+    opts = [tracker_settings: settings(), github_client: client, scope_checker: denied, issue: issue()]
 
     refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, opts)["success"]
 
@@ -190,9 +235,61 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
            )["success"]
   end
 
+  test "all mutations are bound to the current session issue identity" do
+    client = fn _, _, _, _, _ -> flunk("mismatched issue context must not reach REST") end
+    opts = tool_opts(client)
+
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 43, "body" => "x"}, opts)["success"]
+
+    wrong_project = put_in(opts[:issue].native_ref["project_item_id"], "PVTI_other")
+    checker = fn _native_ref, _ -> {:error, :github_issue_out_of_scope} end
+
+    refute AgentTool.execute(
+             "github_apply_workflow_label",
+             %{"issue_number" => 42, "label" => "symphony:human-review"},
+             Keyword.merge(opts, issue: wrong_project, scope_checker: checker)
+           )["success"]
+  end
+
+  test "workpad marker must be the exact first line" do
+    test_pid = self()
+
+    client = fn method, _path, _params, body, _opts ->
+      send(test_pid, {method, body})
+
+      case method do
+        "GET" ->
+          {:ok,
+           %{
+             status: 200,
+             body: [
+               %{
+                 "id" => 1,
+                 "body" => "quoted <!-- symphony-workpad:v1 --> marker",
+                 "user" => %{"node_id" => "U_actor"}
+               }
+             ]
+           }}
+
+        "POST" ->
+          {:ok, %{status: 201, body: %{"id" => 2}}}
+      end
+    end
+
+    assert AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "new"}, tool_opts(client))["success"]
+    assert_received {"POST", %{"body" => "<!-- symphony-workpad:v1 -->\nnew"}}
+  end
+
   test "mutation tools reject malformed, ambiguous, unowned, and non-draft inputs" do
     refute AgentTool.execute("unknown", %{}, [])["success"]
     refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, [])["success"]
+
+    valid_without_issue = [
+      tracker_settings: settings(),
+      github_client: fn _, _, _, _, _ -> flunk("missing issue context must not call GitHub") end
+    ]
+
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, valid_without_issue)["success"]
     refute AgentTool.execute("github_workpad", %{}, tool_opts(fn _, _, _, _, _ -> flunk("no call") end))["success"]
 
     comments = [
@@ -228,6 +325,23 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, invalid_settings)["success"]
 
+    malformed_write = fn
+      "GET", _, _, _, _ -> {:ok, %{status: 200, body: []}}
+      "POST", _, _, _, _ -> {:ok, %{status: 201, body: %{}}}
+    end
+
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tool_opts(malformed_write))["success"]
+
+    malformed_label = fn "POST", _, _, _, _ ->
+      {:ok, %{status: 200, body: %{"labels" => [%{"name" => nil}]}}}
+    end
+
+    refute AgentTool.execute(
+             "github_apply_workflow_label",
+             %{"issue_number" => 42, "label" => "symphony:human-review"},
+             tool_opts(malformed_label)
+           )["success"]
+
     non_draft = fn "GET", path, _, _, _ ->
       if String.contains?(path, "/pulls/"),
         do: {:ok, %{status: 200, body: %{"draft" => false}}},
@@ -239,6 +353,29 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     bad_status = fn "GET", _, _, _, _ -> {:ok, %{status: 500, body: %{}}} end
     refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => url}, tool_opts(bad_status))["success"]
+
+    wrong_base = fn "GET", path, _, _, _ ->
+      if String.contains?(path, "/pulls/"),
+        do:
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "draft" => true,
+               "state" => "open",
+               "html_url" => url,
+               "base" => %{
+                 "ref" => "main",
+                 "repo" => %{"full_name" => "Korano-coder/Renewable-Fuels-Trading-Intelligence"}
+               }
+             }
+           }},
+        else: {:ok, %{status: 200, body: []}}
+    end
+
+    refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => url}, tool_opts(wrong_base))[
+             "success"
+           ]
 
     refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => "https://github.com/Korano-coder/Renewable-Fuels-Trading-Intelligence/pull/nope"}, tool_opts(non_draft))[
              "success"
@@ -264,6 +401,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
             "repo" => "Korano-coder/Renewable-Fuels-Trading-Intelligence",
             "repository_id" => "R_repo",
             "project_id" => "PVT_project",
+            "base_branch" => "staging",
             "ready_label" => "symphony:ready",
             "status_field_id" => "PVTF_status",
             "status_options" => %{"OPT_ready" => "Ready", "OPT_review" => "Human Review", "OPT_done" => "Done"},
@@ -283,8 +421,29 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     do: [
       tracker_settings: settings(),
       github_client: client,
-      scope_checker: fn 42, _ -> :ok end
+      scope_checker: fn native_ref, _ ->
+        if native_ref == issue().native_ref, do: :ok, else: {:error, :github_issue_out_of_scope}
+      end,
+      issue: issue()
     ]
+
+  defp issue do
+    %Issue{
+      id: "PVTI_item_42",
+      identifier: "GH-42",
+      title: "Issue 42",
+      state: "Ready",
+      dispatchable: true,
+      native_ref: %{
+        "project_id" => "PVT_project",
+        "project_item_id" => "PVTI_item_42",
+        "repository_id" => "R_repo",
+        "repository" => "Korano-coder/Renewable-Fuels-Trading-Intelligence",
+        "issue_id" => "I_issue_42",
+        "issue_number" => 42
+      }
+    }
+  end
 
   defp response(nodes, page_info \\ %{"hasNextPage" => false, "endCursor" => nil}, remaining \\ 100) do
     %{"data" => %{"node" => %{"id" => "PVT_project", "items" => %{"nodes" => nodes, "pageInfo" => page_info}}, "rateLimit" => %{"remaining" => remaining, "resetAt" => "2026-01-01T00:00:00Z"}}}

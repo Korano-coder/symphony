@@ -253,7 +253,7 @@ codex:
 The GitHub adapter is intentionally fail closed and supports exactly one GitHub.com repository and
 one Project v2. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete profile.
 
-- Required stable scope: `repo`, `repository_id`, and `project_id`. Symphony never discovers or
+- Required stable scope: `repo`, `repository_id`, `project_id`, and `base_branch`. Symphony never discovers or
   substitutes these identifiers and never falls back to `GITHUB_REPO`.
 - Required workflow metadata: `ready_label`, `status_field_id`, explicit `status_options`,
   `ready_statuses`, `priority_field_id`, explicit integer `priority_options`, `workflow_labels`, and
@@ -272,7 +272,10 @@ one Project v2. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete 
   `timeout_ms` (default 30000), strict cursor checks, and explicit permission/rate-limit errors.
 - Mutations: Codex receives only `github_workpad`, `github_apply_workflow_label`, and
   `github_attach_draft_pr`. They can upsert one marker-owned workpad comment, apply one configured
-  allowlisted label, and verify/attach a Draft PR URL in the configured repository. There is no raw
+  allowlisted label, and verify/attach an open Draft PR URL whose base repository and branch exactly
+  match the configured scope. Every mutation is bound to the current session's repository, Project,
+  Project-item, issue node, and issue number. Tool results contain only minimal IDs/status, not raw
+  provider bodies. There is no raw
   REST/GraphQL tool and no delete, repository administration, branch protection, merge, or Project
   mutation capability.
 
@@ -365,8 +368,40 @@ a real agent turn, verifies the workspace side effect, requires Codex to comment
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
 The former generic GitHub Issues live test does not apply to the compact Projects v2 pilot profile.
-Pilot validation should use a dedicated repository and Project populated with the exact node and
-field identifiers documented in `WORKFLOW.github.md`.
+The replacement is an opt-in, fail-closed test that uses an already-provisioned dedicated pilot
+issue, Project item, allowlisted label, and open Draft PR. It never creates, closes, deletes, merges,
+or changes a branch. It updates only the dedicated issue's Symphony workpad and adds the configured
+workflow label:
+
+```bash
+cd elixir
+export SYMPHONY_GITHUB_TOKEN=...
+export SYMPHONY_LIVE_GITHUB_REPO=owner/repo
+export SYMPHONY_LIVE_GITHUB_REPOSITORY_ID=R_...
+export SYMPHONY_LIVE_GITHUB_PROJECT_ID=PVT_...
+export SYMPHONY_LIVE_GITHUB_PROJECT_ITEM_ID=PVTI_...
+export SYMPHONY_LIVE_GITHUB_ISSUE_NUMBER=123
+export SYMPHONY_LIVE_GITHUB_BASE_BRANCH=staging
+export SYMPHONY_LIVE_GITHUB_DRAFT_PR_URL=https://github.com/owner/repo/pull/456
+export SYMPHONY_LIVE_GITHUB_ACTOR_ID=U_...
+export SYMPHONY_LIVE_GITHUB_READY_LABEL=symphony:ready
+export SYMPHONY_LIVE_GITHUB_WORKFLOW_LABEL=symphony:human-review
+export SYMPHONY_LIVE_GITHUB_STATUS_FIELD_ID=PVTF_...
+export SYMPHONY_LIVE_GITHUB_STATUS_OPTIONS='{"option-ready":"Ready","option-review":"Human Review"}'
+export SYMPHONY_LIVE_GITHUB_READY_STATUS=Ready
+export SYMPHONY_LIVE_GITHUB_TERMINAL_STATUS='Human Review'
+export SYMPHONY_LIVE_GITHUB_PRIORITY_FIELD_ID=PVTF_...
+export SYMPHONY_LIVE_GITHUB_PRIORITY_OPTIONS='{"option-p1":1}'
+SYMPHONY_RUN_GITHUB_PILOT_LIVE_E2E=1 \
+  mix test test/symphony_elixir/github_pilot_live_e2e_test.exs
+```
+
+Before any live pilot, independently verify that the execution credential is non-admin and cannot
+merge PRs, delete content, change repository settings/rulesets/branch protection, or write `main`;
+that `main` and `staging` reject direct pushes; and that only feature branches can be pushed. The
+adapter cannot turn a broadly privileged SSH key into a branch-scoped credential. Treat any missing
+server-side control as a hard NO-GO even though the in-process GitHub tools themselves have no merge,
+delete, administration, Project-mutation, or branch-write route.
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
 create, comment on, transition, and delete issues:
