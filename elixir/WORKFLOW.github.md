@@ -55,11 +55,12 @@ merge the PR and never modify `main` directly.
 Before enabling this workflow, run the opt-in live E2E with the exact fine-grained PAT. It must read
 the private issue body and Draft PR metadata, create and update the issue workpad comment, apply only
 allowlisted workflow labels, and receive `403` or `404` from read-only probes of Contents, git refs,
-branch protection/rulesets, Actions/workflows, and Projects.
+branch protection/rulesets, and Actions/workflows.
 
 Set the live test's separate expected-repository name and node-ID variables to the dedicated pilot
-repository. The test verifies both before its first GitHub request and always rejects a repository
-named `Renewable-Fuels`.
+repository and issue pilot actually used. The test verifies both before its first GitHub request and
+also rejects the exact repository name `Renewable-Fuels`; that name check does not reject the
+distinct `Renewable-Fuels-Trading-Intelligence` name.
 
 Do not interpret `GET /repos/{owner}/{repo}.permissions` as the PAT's grants: those flags describe
 the authenticated user's repository role and can be `admin=true` or `push=true` for a repository
@@ -69,5 +70,13 @@ GitHub documents Contents write as the permission required to merge a pull reque
 safe read-only merge-authority probe for a fine-grained PAT. Never issue a merge, branch mutation,
 deletion, administration mutation, or workflow mutation to test denial. Instead, inspect the PAT's
 configured permission contract (Issues write; Pull requests read; no Contents, Administration,
-Actions, Workflows, or Projects grant) and use the denied Contents/git-ref reads as supporting
+Actions, or Workflows grant) and use the denied Contents/git-ref reads as supporting
 runtime evidence, not as a claim that a merge denial was directly exercised.
+
+The pilot PAT was manually configured without an explicit Projects permission. GitHub may still
+return readable Project metadata through GraphQL; generic read visibility is not proof of a Projects
+permission or mutation authority. Symphony has no Project query or mutation route, Project
+configuration/native reference, or Project tool, and rejects Project-shaped configuration, tool
+names, and tool inputs. It never uses any incidental Project read visibility. The absence of Project
+mutation authority cannot be safely runtime-tested without making a mutation, so do not add a
+Project read-denial assertion or a side-effecting Project permission probe.

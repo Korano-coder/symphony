@@ -371,7 +371,7 @@ Linear issue, then marks the project completed so the run remains visible in Lin
 The opt-in, fail-closed GitHub test uses an already-provisioned dedicated issue and open Draft PR.
 With the exact token under test, it proves that the private issue body and Draft PR metadata are
 readable; issue-comment create/update and allowlisted label mutations succeed; and read-only probes
-of Contents, git refs, branch protection/rulesets, Actions/workflows, and Projects are denied. It
+of Contents, git refs, branch protection/rulesets, and Actions/workflows are denied. It
 never creates, closes, deletes, merges, changes a branch, changes administration settings, or
 mutates a workflow:
 
@@ -392,9 +392,11 @@ SYMPHONY_RUN_GITHUB_PILOT_LIVE_E2E=1 \
   mix test test/symphony_elixir/github_pilot_live_e2e_test.exs
 ```
 
-The test compares both target values with their separately supplied expected values before its first
-GitHub request and refuses any repository named `Renewable-Fuels` (case-insensitively). Use only a
-dedicated pilot repository.
+The test compares the configured repository and repository node ID with separately supplied expected
+values before its first GitHub request. It also rejects the exact repository name
+`Renewable-Fuels` (case-insensitively); that name check does not reject the distinct
+`Renewable-Fuels-Trading-Intelligence` name. The explicit expected values are the authoritative
+confirmation of the repository/issue pilot target actually in use.
 
 `GET /repos/{owner}/{repo}.permissions` reports the authenticated user's repository role. In a
 user-owned repository it can report `admin=true` and `push=true` for the owner even when the exact
@@ -407,8 +409,12 @@ says that merging requires Contents write, but GitHub does not document a safe, 
 that reports whether a fine-grained PAT can merge. The live test therefore does not claim direct
 runtime proof of absent merge authority and never attempts a merge. The pilot contract instead
 requires a PAT configured with Issues write and Pull requests read only, with no Contents,
-Administration, Actions, Workflows, or Projects grant; denied Contents and git-ref reads are runtime
-supporting evidence for that configured contract. GitHub's
+Administration, Actions, or Workflows grant. The pilot PAT was manually configured without an
+explicit Projects permission. GitHub may nevertheless expose readable Project metadata through
+GraphQL; generic read visibility is not evidence of a Projects permission or mutation authority,
+and Symphony never uses that visibility. Absence of Project mutation authority cannot be safely
+runtime-tested without attempting a mutation, so the live test makes no such probe or claim. Denied
+Contents and git-ref reads are runtime supporting evidence for that configured contract. GitHub's
 [permission-header documentation](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#resource-not-found)
 defines `X-Accepted-GitHub-Permissions` in terms of endpoint requirements.
 

@@ -42,7 +42,11 @@ defmodule SymphonyElixir.GitHub.AgentTool do
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts) when tool in @tools and is_map(arguments) do
-    case run(tool, arguments, opts) do
+    case validate_arguments(tool, arguments) do
+      :ok -> run(tool, arguments, opts)
+      {:error, _} = error -> error
+    end
+    |> case do
       {:ok, payload} -> response(true, payload)
       {:error, reason} -> response(false, %{"error" => %{"code" => error_code(reason)}})
     end
@@ -50,6 +54,11 @@ defmodule SymphonyElixir.GitHub.AgentTool do
 
   def execute(_tool, _arguments, _opts),
     do: response(false, %{"error" => %{"code" => "unsupported_github_tool", "supportedTools" => @tools}})
+
+  defp validate_arguments("github_workpad", arguments), do: exact_keys(arguments, ["body", "issue_number"])
+  defp validate_arguments("github_apply_workflow_label", arguments), do: exact_keys(arguments, ["issue_number", "label"])
+  defp validate_arguments("github_attach_draft_pr", arguments), do: exact_keys(arguments, ["issue_number", "pr_url"])
+  defp exact_keys(arguments, expected), do: if(Enum.sort(Map.keys(arguments)) == expected, do: :ok, else: {:error, :invalid_arguments})
 
   defp run("github_workpad", %{"issue_number" => number, "body" => body}, opts)
        when is_integer(number) and number > 0 and is_binary(body) and byte_size(body) in 1..60_000,

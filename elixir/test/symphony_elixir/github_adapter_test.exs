@@ -13,9 +13,20 @@ defmodule SymphonyElixir.GitHubAdapterTest do
     assert {:error, :missing_github_repository_id} = Adapter.validate_config(settings(%{"repository_id" => nil}))
     assert {:error, :invalid_github_workflow_labels} = Adapter.validate_config(settings(%{"workflow_labels" => ["symphony:ready"]}))
     assert {:error, :invalid_github_priority_labels} = Adapter.validate_config(settings(%{"priority_labels" => ["priority:p0"]}))
+
+    for project_settings <- [
+          settings(%{"project_id" => "PVT_1"}),
+          Map.put(settings(), :project_id, "PVT_1"),
+          settings(%{"extension" => %{"project_number" => 1}}),
+          settings(%{project_ref: "PVT_1"})
+        ] do
+      assert {:error, :github_project_configuration_not_allowed} = Adapter.validate_config(project_settings)
+    end
+
     assert {:error, :missing_github_ready_label_gate} = Adapter.validate_config(%{settings() | required_labels: []})
     assert Enum.map(Adapter.agent_tool_specs(), & &1["name"]) == ["github_workpad", "github_apply_workflow_label", "github_attach_draft_pr"]
     refute Enum.any?(Adapter.agent_tool_specs(), &(&1["name"] == "github_api"))
+    refute Enum.any?(Adapter.agent_tool_specs(), &String.contains?(String.downcase(&1["name"]), "project"))
     assert "PILOT_GITHUB_TOKEN" in Client.secret_environment_names(settings(%{"token" => "$PILOT_GITHUB_TOKEN"}))
 
     assert {:error, :missing_github_active_states} =
@@ -262,9 +273,29 @@ defmodule SymphonyElixir.GitHubAdapterTest do
     refute String.contains?(output, token)
   end
 
+  test "adapter and agent tools reject Project-shaped access" do
+    no_call = fn _, _, _, _, _ -> flunk("Project-shaped request reached GitHub") end
+
+    assert {:error, :github_scope_violation} =
+             Client.rest("GET", "/graphql", %{"query" => "query { viewer { projectsV2(first: 1) { totalCount } } }"}, nil, tracker_settings: settings(), request_fun: no_call)
+
+    for tool <- ["github_project", "github_projects_v2", "github_project_mutation"] do
+      refute AgentTool.execute(tool, %{}, tool_opts(no_call))["success"]
+    end
+
+    for {tool, arguments} <- [
+          {"github_workpad", %{"issue_number" => 42, "body" => "x", "project_id" => "PVT_1"}},
+          {"github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:done", "project_number" => 1}},
+          {"github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => "https://github.com/owner/repo/pull/7", "project_item_id" => "PVTI_1"}}
+        ] do
+      refute AgentTool.execute(tool, arguments, tool_opts(no_call))["success"]
+    end
+  end
+
   test "mutation tools fail closed for malformed inputs and responses" do
     refute AgentTool.execute("unknown", %{}, [])["success"]
     refute AgentTool.execute("github_workpad", %{}, tool_opts(mutation_client([])))["success"]
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => 123}, tool_opts(mutation_client([])))["success"]
     refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, [])["success"]
 
     crowded = mutation_client(List.duplicate(%{}, 100))

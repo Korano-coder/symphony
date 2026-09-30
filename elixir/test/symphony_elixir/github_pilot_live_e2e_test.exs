@@ -49,7 +49,6 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
       request_status_and_headers("GET", path, settings)
     end)
 
-    assert project_access_unavailable?(settings)
     # GitHub documents no read-only merge-authority probe. The test never sends a merge request.
     # Merge absence remains a configured-token contract supported, but not runtime-proven, by the
     # denied Contents and git-ref reads above.
@@ -68,22 +67,6 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
 
     assert :ok = assert_read_capabilities_denied!("owner/repo", requester)
     assert length(denial_probe_paths("owner/repo")) == 8
-  end
-
-  test "unrelated GraphQL errors do not prove Project access denial" do
-    refute project_access_denied?(200, %{
-             "errors" => [%{"type" => "RATE_LIMITED", "path" => ["viewer", "projectsV2"]}]
-           })
-
-    assert project_access_denied?(200, %{
-             "errors" => [
-               %{
-                 "type" => "FORBIDDEN",
-                 "path" => ["viewer", "projectsV2"],
-                 "message" => "Resource not accessible by personal access token"
-               }
-             ]
-           })
   end
 
   defp settings_from_env! do
@@ -165,32 +148,6 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
     {:ok, %{status: status, headers: headers}} = request(method, path, %{}, nil, settings)
     {status, headers}
   end
-
-  defp project_access_unavailable?(_settings) do
-    query = %{"query" => "query { viewer { projectsV2(first: 1) { totalCount } } }"}
-
-    case Req.post("https://api.github.com/graphql", headers: headers(), json: query) do
-      {:ok, response} -> project_access_denied?(response.status, response.body)
-      {:error, _reason} -> false
-    end
-  end
-
-  defp project_access_denied?(200, %{"errors" => errors}) when is_list(errors) do
-    Enum.any?(errors, fn
-      %{
-        "type" => "FORBIDDEN",
-        "path" => ["viewer", "projectsV2"],
-        "message" => message
-      }
-      when is_binary(message) ->
-        String.contains?(String.downcase(message), "not accessible")
-
-      _ ->
-        false
-    end)
-  end
-
-  defp project_access_denied?(_status, _body), do: false
 
   defp assert_pilot_target!(repo, repository_id, expected_repo, expected_repository_id) do
     repository_name = repo |> String.split("/") |> List.last() |> String.downcase()

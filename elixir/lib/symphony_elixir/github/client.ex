@@ -285,7 +285,8 @@ defmodule SymphonyElixir.GitHub.Client do
   defp parse_settings(tracker) do
     value = provider(tracker)
 
-    with {:ok, repo} <- repo(value["repo"]),
+    with :ok <- reject_project_configuration(tracker),
+         {:ok, repo} <- repo(value["repo"]),
          {:ok, repository_id} <- id(value["repository_id"], :missing_github_repository_id),
          {:ok, base_branch} <- branch(value["base_branch"]),
          {:ok, actor_id} <- id(value["actor_id"], :missing_github_actor_id),
@@ -315,6 +316,23 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp provider(%{provider: value}) when is_map(value), do: value
   defp provider(_), do: %{}
+
+  defp reject_project_configuration(value) do
+    if project_configuration?(value),
+      do: {:error, :github_project_configuration_not_allowed},
+      else: :ok
+  end
+
+  defp project_configuration?(value) when is_map(value) do
+    Enum.any?(value, fn {key, nested} -> project_key?(key) or project_configuration?(nested) end)
+  end
+
+  defp project_configuration?(value) when is_list(value), do: Enum.any?(value, &project_configuration?/1)
+  defp project_configuration?(_value), do: false
+  defp project_key?(key) when is_binary(key), do: String.contains?(String.downcase(key), "project")
+  defp project_key?(key) when is_atom(key), do: key |> Atom.to_string() |> project_key?()
+  defp project_key?(_key), do: false
+
   defp repo(value) when is_binary(value), do: if(String.match?(String.trim(value), ~r/^[^\s\/]+\/[^\s\/]+$/), do: {:ok, String.trim(value)}, else: {:error, :invalid_github_repo})
   defp repo(_), do: {:error, :missing_github_repo}
   defp branch(value) when is_binary(value), do: if(present?(value), do: {:ok, String.trim(value)}, else: {:error, :invalid_github_base_branch})
