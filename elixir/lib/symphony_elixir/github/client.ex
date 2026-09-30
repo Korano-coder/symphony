@@ -136,11 +136,16 @@ defmodule SymphonyElixir.GitHub.Client do
        when is_map(pull_request),
        do: {:cont, result}
 
-  defp normalize_page_item(raw, {:ok, acc, seen}, settings, request_fun, states, ids) do
+  defp normalize_page_item(raw, result, settings, request_fun, states, ids) do
+    if candidate?(raw, ids),
+      do: normalize_candidate(raw, result, settings, request_fun, states, ids),
+      else: {:cont, result}
+  end
+
+  defp normalize_candidate(raw, {:ok, acc, seen}, settings, request_fun, states, ids) do
     with {:ok, issue} <- normalize_issue(raw, settings, request_fun),
          false <- MapSet.member?(seen, issue.id) do
-      selected =
-        if is_nil(ids), do: MapSet.member?(states, issue.state), else: MapSet.member?(ids, issue.id)
+      selected = if(is_nil(ids), do: MapSet.member?(states, issue.state), else: true)
 
       {:cont, {:ok, if(selected, do: acc ++ [issue], else: acc), MapSet.put(seen, issue.id)}}
     else
@@ -148,6 +153,13 @@ defmodule SymphonyElixir.GitHub.Client do
       {:error, reason} -> {:halt, {:error, reason}}
     end
   end
+
+  defp candidate?(raw, %MapSet{} = ids) when is_map(raw), do: MapSet.member?(ids, raw["node_id"])
+
+  defp candidate?(%{"labels" => labels}, nil) when is_list(labels),
+    do: Enum.any?(labels, &match?(%{"name" => name} when name in @workflow_labels, &1))
+
+  defp candidate?(_, _), do: false
 
   defp normalize_issue(raw, settings, request_fun) when is_map(raw) do
     with true <- not is_map(raw["pull_request"]) or {:error, :github_pull_request_not_allowed},

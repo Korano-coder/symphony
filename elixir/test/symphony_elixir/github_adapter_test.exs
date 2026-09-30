@@ -52,6 +52,36 @@ defmodule SymphonyElixir.GitHubAdapterTest do
     refute Enum.any?(Map.keys(issue.native_ref), &String.contains?(&1, "project"))
   end
 
+  test "explicit ID lookup ignores ordinary repository issues before the requested issue" do
+    ordinary = Enum.map(1..75, &ordinary_issue/1)
+    request = polling_client(ordinary ++ [raw_issue(759)])
+
+    assert {:ok, [issue]} =
+             Client.fetch_for_test(["symphony:ready"], ["I_759"], settings(), request)
+
+    assert issue.id == "I_759"
+  end
+
+  test "ready-state polling ignores ordinary issues without Symphony workflow labels" do
+    request = polling_client(Enum.map(1..75, &ordinary_issue/1) ++ [raw_issue(759)])
+
+    assert {:ok, [issue]} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), request)
+
+    assert issue.id == "I_759"
+  end
+
+  test "actual Symphony candidates still fail closed for malformed and conflicting labels" do
+    malformed = put_in(raw_issue(), ["labels"], [%{"name" => "symphony:ready"}, %{}])
+    conflicting = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "symphony:done", "priority:p1"]))
+
+    assert {:error, :github_malformed_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([malformed]))
+
+    assert {:error, :github_conflicting_workflow_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([conflicting]))
+  end
+
   test "pagination is bounded" do
     endless = fn
       "GET", "/repos/owner/repo", _, _, _ -> {:ok, %{status: 200, body: repository()}}
@@ -85,13 +115,37 @@ defmodule SymphonyElixir.GitHubAdapterTest do
     assert length(issues) == 101
   end
 
+  test "explicit lookup traverses ordinary pages and rejects duplicate candidates" do
+    request = fn
+      "GET", "/repos/owner/repo", _, _, _ ->
+        {:ok, %{status: 200, body: repository()}}
+
+      "GET", "/repos/owner/repo/issues", %{"page" => 1}, _, _ ->
+        {:ok, %{status: 200, body: Enum.map(1..100, &ordinary_issue/1)}}
+
+      "GET", "/repos/owner/repo/issues", %{"page" => 2}, _, _ ->
+        {:ok, %{status: 200, body: [raw_issue(759), raw_issue(759)]}}
+
+      "GET", path, _, _, _ ->
+        if String.ends_with?(path, "/dependencies/blocked_by"),
+          do: {:ok, %{status: 200, body: []}},
+          else: {:ok, %{status: 404, body: %{}}}
+    end
+
+    assert {:error, :github_ambiguous_issue} =
+             Client.fetch_for_test(["symphony:ready"], ["I_759"], settings(), request)
+  end
+
   test "fails closed for exact labels, conflicts, blockers, malformed data, and denial" do
     wrong_case = put_in(raw_issue(), ["labels"], labels(["Symphony:Ready", "priority:p1"]))
     conflict = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "symphony:done", "priority:p1"]))
     priorities = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "priority:p0", "priority:p1"]))
 
-    assert {:error, :github_missing_workflow_label} =
+    assert {:ok, []} =
              Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([wrong_case]))
+
+    assert {:error, :github_missing_workflow_label} =
+             Client.fetch_for_test(["symphony:ready"], ["I_42"], settings(), polling_client([wrong_case]))
 
     assert {:error, :github_conflicting_workflow_labels} =
              Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([conflict]))
@@ -315,6 +369,9 @@ defmodule SymphonyElixir.GitHubAdapterTest do
         },
         extra
       )
+
+  defp ordinary_issue(number),
+    do: raw_issue(number, %{"labels" => labels(["bug", "priority:p2"])})
 
   defp blocker do
     %{
