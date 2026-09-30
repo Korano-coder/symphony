@@ -49,3 +49,25 @@ Start the feature branch from the exact current `origin/staging` head. Implement
 change, push only that feature branch, and open a Draft PR targeting `staging`. Record the Draft PR
 URL with `github_attach_draft_pr`, apply `symphony:human-review`, and stop for human review. Never
 merge the PR and never modify `main` directly.
+
+## Live-pilot credential proof contract
+
+Before enabling this workflow, run the opt-in live E2E with the exact fine-grained PAT. It must read
+the private issue body and Draft PR metadata, create and update the issue workpad comment, apply only
+allowlisted workflow labels, and receive `403` or `404` from read-only probes of Contents, git refs,
+branch protection/rulesets, Actions/workflows, and Projects.
+
+Set the live test's separate expected-repository name and node-ID variables to the dedicated pilot
+repository. The test verifies both before its first GitHub request and always rejects a repository
+named `Renewable-Fuels`.
+
+Do not interpret `GET /repos/{owner}/{repo}.permissions` as the PAT's grants: those flags describe
+the authenticated user's repository role and can be `admin=true` or `push=true` for a repository
+owner. `X-Accepted-GitHub-Permissions` describes what an endpoint accepts, not what the token has.
+
+GitHub documents Contents write as the permission required to merge a pull request, but documents no
+safe read-only merge-authority probe for a fine-grained PAT. Never issue a merge, branch mutation,
+deletion, administration mutation, or workflow mutation to test denial. Instead, inspect the PAT's
+configured permission contract (Issues write; Pull requests read; no Contents, Administration,
+Actions, Workflows, or Projects grant) and use the denied Contents/git-ref reads as supporting
+runtime evidence, not as a claim that a merge denial was directly exercised.

@@ -20,34 +20,91 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
 
     opts = [tracker_settings: settings, issue: issue]
     body = "Safe repository-only live validation #{System.system_time(:second)}"
+
+    assert {:ok, %{status: 201, body: %{"id" => comment_id}}} =
+             request(
+               "POST",
+               "/repos/#{settings.provider["repo"]}/issues/#{number}/comments",
+               %{},
+               %{"body" => body},
+               settings
+             )
+
+    assert {:ok, %{status: 200}} =
+             request(
+               "PATCH",
+               "/repos/#{settings.provider["repo"]}/issues/comments/#{comment_id}",
+               %{},
+               %{"body" => body <> " updated"},
+               settings
+             )
+
     assert success?(AgentTool.execute("github_workpad", %{"issue_number" => number, "body" => body}, opts))
     assert success?(AgentTool.execute("github_workpad", %{"issue_number" => number, "body" => body <> " updated"}, opts))
     assert success?(AgentTool.execute("github_apply_workflow_label", %{"issue_number" => number, "label" => "symphony:in-progress"}, opts))
     assert success?(AgentTool.execute("github_apply_workflow_label", %{"issue_number" => number, "label" => "symphony:ready"}, opts))
     assert success?(AgentTool.execute("github_attach_draft_pr", %{"issue_number" => number, "pr_url" => draft_pr_url}, opts))
 
-    repo = settings.provider["repo"]
-    assert %{"permissions" => permissions} = get!("/repos/#{repo}", settings)
-    refute permissions["admin"] or permissions["maintain"] or permissions["push"]
-
-    for path <- ["/repos/#{repo}/contents/", "/repos/#{repo}/git/ref/heads/main", "/repos/#{repo}/git/ref/heads/staging", "/repos/#{repo}/branches/main/protection", "/repos/#{repo}/actions/workflows"] do
-      assert request_status("GET", path, settings) in [403, 404]
-    end
+    assert_read_capabilities_denied!(settings.provider["repo"], fn path ->
+      request_status_and_headers("GET", path, settings)
+    end)
 
     assert project_access_unavailable?(settings)
-    # No merge request is sent: Pull requests read-only plus `permissions.push == false` proves it
-    # is unavailable without risking mutation of the pre-provisioned Draft PR.
+    # GitHub documents no read-only merge-authority probe. The test never sends a merge request.
+    # Merge absence remains a configured-token contract supported, but not runtime-proven, by the
+    # denied Contents and git-ref reads above.
+  end
+
+  test "repository owner role flags cannot satisfy or fail the token denial probes" do
+    owner_repository_response = %{
+      "permissions" => %{"admin" => true, "maintain" => true, "push" => true}
+    }
+
+    requester = fn path ->
+      refute path == "/repos/owner/repo"
+      assert owner_repository_response["permissions"]["admin"]
+      {403, %{"x-accepted-github-permissions" => ["contents=read"]}}
+    end
+
+    assert :ok = assert_read_capabilities_denied!("owner/repo", requester)
+    assert length(denial_probe_paths("owner/repo")) == 8
+  end
+
+  test "unrelated GraphQL errors do not prove Project access denial" do
+    refute project_access_denied?(200, %{
+             "errors" => [%{"type" => "RATE_LIMITED", "path" => ["viewer", "projectsV2"]}]
+           })
+
+    assert project_access_denied?(200, %{
+             "errors" => [
+               %{
+                 "type" => "FORBIDDEN",
+                 "path" => ["viewer", "projectsV2"],
+                 "message" => "Resource not accessible by personal access token"
+               }
+             ]
+           })
   end
 
   defp settings_from_env! do
+    repo = required_env!("SYMPHONY_LIVE_GITHUB_REPO")
+    repository_id = required_env!("SYMPHONY_LIVE_GITHUB_REPOSITORY_ID")
+
+    assert_pilot_target!(
+      repo,
+      repository_id,
+      required_env!("SYMPHONY_LIVE_GITHUB_EXPECTED_REPO"),
+      required_env!("SYMPHONY_LIVE_GITHUB_EXPECTED_REPOSITORY_ID")
+    )
+
     %{
       kind: "github",
       required_labels: ["symphony:ready"],
       active_states: ["symphony:ready", "symphony:in-progress"],
       terminal_states: ["symphony:human-review", "symphony:done"],
       provider: %{
-        "repo" => required_env!("SYMPHONY_LIVE_GITHUB_REPO"),
-        "repository_id" => required_env!("SYMPHONY_LIVE_GITHUB_REPOSITORY_ID"),
+        "repo" => repo,
+        "repository_id" => repository_id,
         "base_branch" => required_env!("SYMPHONY_LIVE_GITHUB_BASE_BRANCH"),
         "token" => "$SYMPHONY_GITHUB_TOKEN",
         "workflow_labels" => ~w(symphony:ready symphony:in-progress symphony:human-review symphony:done),
@@ -70,25 +127,78 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
     opts = if is_nil(body), do: opts, else: Keyword.put(opts, :json, body)
 
     case Req.request(opts) do
-      {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
-      {:error, _} -> {:error, :github_transport}
+      {:ok, response} ->
+        {:ok, %{status: response.status, body: response.body, headers: response.headers}}
+
+      {:error, _} ->
+        {:error, :github_transport}
     end
   end
 
-  defp get!(path, settings) do
-    {:ok, %{status: 200, body: body}} = request("GET", path, %{}, nil, settings)
-    body
+  defp assert_read_capabilities_denied!(repo, requester) do
+    for path <- denial_probe_paths(repo) do
+      {status, headers} = requester.(path)
+      accepted_permissions = header_value(headers, "x-accepted-github-permissions")
+
+      assert status in [403, 404],
+             "expected #{path} to be denied, got HTTP #{status}; " <>
+               "endpoint accepts #{inspect(accepted_permissions)}"
+    end
+
+    :ok
   end
 
-  defp request_status(method, path, settings) do
-    {:ok, %{status: status}} = request(method, path, %{}, nil, settings)
-    status
+  defp denial_probe_paths(repo) do
+    [
+      "/repos/#{repo}/contents/",
+      "/repos/#{repo}/git/ref/heads/main",
+      "/repos/#{repo}/git/ref/heads/staging",
+      "/repos/#{repo}/git/matching-refs/heads/",
+      "/repos/#{repo}/branches/main/protection",
+      "/repos/#{repo}/rulesets",
+      "/repos/#{repo}/actions/workflows",
+      "/repos/#{repo}/actions/permissions"
+    ]
+  end
+
+  defp request_status_and_headers(method, path, settings) do
+    {:ok, %{status: status, headers: headers}} = request(method, path, %{}, nil, settings)
+    {status, headers}
   end
 
   defp project_access_unavailable?(_settings) do
     query = %{"query" => "query { viewer { projectsV2(first: 1) { totalCount } } }"}
-    {:ok, response} = Req.post("https://api.github.com/graphql", headers: headers(), json: query)
-    response.status in [401, 403] or match?(%{"errors" => [_ | _]}, response.body)
+
+    case Req.post("https://api.github.com/graphql", headers: headers(), json: query) do
+      {:ok, response} -> project_access_denied?(response.status, response.body)
+      {:error, _reason} -> false
+    end
+  end
+
+  defp project_access_denied?(200, %{"errors" => errors}) when is_list(errors) do
+    Enum.any?(errors, fn
+      %{
+        "type" => "FORBIDDEN",
+        "path" => ["viewer", "projectsV2"],
+        "message" => message
+      }
+      when is_binary(message) ->
+        String.contains?(String.downcase(message), "not accessible")
+
+      _ ->
+        false
+    end)
+  end
+
+  defp project_access_denied?(_status, _body), do: false
+
+  defp assert_pilot_target!(repo, repository_id, expected_repo, expected_repository_id) do
+    repository_name = repo |> String.split("/") |> List.last() |> String.downcase()
+
+    if repo != expected_repo or repository_id != expected_repository_id or
+         repository_name == "renewable-fuels" do
+      raise "GitHub live E2E target does not match the confirmed dedicated pilot repository"
+    end
   end
 
   defp headers,
@@ -100,6 +210,8 @@ defmodule SymphonyElixir.GitHub.PilotLiveE2ETest do
     ]
 
   defp success?(%{"success" => true, "output" => output}), do: not String.contains?(output, System.fetch_env!("SYMPHONY_GITHUB_TOKEN"))
+  defp header_value(headers, name) when is_map(headers), do: Map.get(headers, name, [])
+  defp header_value(headers, name) when is_list(headers), do: for({key, value} <- headers, key == name, do: value)
   defp required_env!(name), do: System.fetch_env!(name)
   defp required_integer_env!(name), do: name |> required_env!() |> String.to_integer()
 end

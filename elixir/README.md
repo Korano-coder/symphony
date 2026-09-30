@@ -369,15 +369,20 @@ a real agent turn, verifies the workspace side effect, requires Codex to comment
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
 The opt-in, fail-closed GitHub test uses an already-provisioned dedicated issue and open Draft PR.
-It proves private issue reads, workpad create/update, allowlisted workflow transitions, Draft PR
-metadata reads, and the absence of Project, Contents/refs, administration, workflow, and merge
-authority. It never creates, closes, deletes, merges, or changes a branch:
+With the exact token under test, it proves that the private issue body and Draft PR metadata are
+readable; issue-comment create/update and allowlisted label mutations succeed; and read-only probes
+of Contents, git refs, branch protection/rulesets, Actions/workflows, and Projects are denied. It
+never creates, closes, deletes, merges, changes a branch, changes administration settings, or
+mutates a workflow:
 
 ```bash
 cd elixir
 export SYMPHONY_GITHUB_TOKEN=...
 export SYMPHONY_LIVE_GITHUB_REPO=owner/repo
 export SYMPHONY_LIVE_GITHUB_REPOSITORY_ID=R_...
+# Independent, fail-closed confirmation of the dedicated pilot target:
+export SYMPHONY_LIVE_GITHUB_EXPECTED_REPO=owner/repo
+export SYMPHONY_LIVE_GITHUB_EXPECTED_REPOSITORY_ID=R_...
 export SYMPHONY_LIVE_GITHUB_ISSUE_NUMBER=123
 export SYMPHONY_LIVE_GITHUB_ISSUE_NODE_ID=I_...
 export SYMPHONY_LIVE_GITHUB_BASE_BRANCH=staging
@@ -387,12 +392,33 @@ SYMPHONY_RUN_GITHUB_PILOT_LIVE_E2E=1 \
   mix test test/symphony_elixir/github_pilot_live_e2e_test.exs
 ```
 
-Before any live pilot, independently verify that the execution credential is non-admin and cannot
-merge PRs, delete content, change repository settings/rulesets/branch protection, or write `main`;
-that `main` and `staging` reject direct pushes; and that only feature branches can be pushed. The
-adapter cannot turn a broadly privileged SSH key into a branch-scoped credential. Treat any missing
-server-side control as a hard NO-GO even though the in-process GitHub tools themselves have no merge,
-delete, administration, Project-mutation, or branch-write route.
+The test compares both target values with their separately supplied expected values before its first
+GitHub request and refuses any repository named `Renewable-Fuels` (case-insensitively). Use only a
+dedicated pilot repository.
+
+`GET /repos/{owner}/{repo}.permissions` reports the authenticated user's repository role. In a
+user-owned repository it can report `admin=true` and `push=true` for the owner even when the exact
+fine-grained PAT has none of the corresponding grants, so it is not token-permission evidence. The
+`X-Accepted-GitHub-Permissions` response header similarly describes permissions accepted by an
+endpoint, not permissions granted to the token; the test records it only as denial diagnostics.
+
+GitHub's [merge endpoint documentation](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+says that merging requires Contents write, but GitHub does not document a safe, read-only request
+that reports whether a fine-grained PAT can merge. The live test therefore does not claim direct
+runtime proof of absent merge authority and never attempts a merge. The pilot contract instead
+requires a PAT configured with Issues write and Pull requests read only, with no Contents,
+Administration, Actions, Workflows, or Projects grant; denied Contents and git-ref reads are runtime
+supporting evidence for that configured contract. GitHub's
+[permission-header documentation](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#resource-not-found)
+defines `X-Accepted-GitHub-Permissions` in terms of endpoint requirements.
+
+Before any live pilot, independently inspect the fine-grained PAT configuration and verify that the
+execution credential has that contract and cannot merge PRs, delete content, change repository
+settings/rulesets/branch protection, or write `main`; that `main` and `staging` reject direct pushes;
+and that only feature branches can be pushed. The adapter cannot turn a broadly privileged SSH key
+into a branch-scoped credential. Treat any missing server-side control as a hard NO-GO even though
+the in-process GitHub tools themselves have no merge, delete, administration, Project-mutation, or
+branch-write route.
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
 create, comment on, transition, and delete issues:
