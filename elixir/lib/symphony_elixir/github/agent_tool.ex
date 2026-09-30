@@ -58,13 +58,16 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   defp run("github_apply_workflow_label", %{"issue_number" => number, "label" => label}, opts)
        when is_integer(number) and number > 0 and is_binary(label) do
     with {:ok, settings} <- tool_settings(opts),
-         :ok <- authorize_issue(number, settings, opts),
          {:ok, allowed_label} <- allowed_label(settings.workflow_labels, label),
+         {:ok, _} <- authorize_issue(number, settings, opts),
+         {:ok, current} <- authorize_issue(number, settings, opts),
+         {:ok, labels} <- transition_labels(current.labels, settings.workflow_labels, allowed_label),
          {:ok, %{status: status, body: body}} <-
-           request("POST", issue_path(settings, number) <> "/labels", %{}, %{"labels" => [allowed_label]}, opts),
+           request("PATCH", issue_path(settings, number), %{}, %{"labels" => labels}, opts),
          true <- status in 200..299 or {:error, {:github_api_status, status}} do
       with %{"labels" => labels} when is_list(labels) <- body,
-           true <- Enum.any?(labels, &(is_map(&1) and normalize(&1["name"]) == normalize(allowed_label))) do
+           names <- Enum.map(labels, & &1["name"]),
+           [^allowed_label] <- Enum.filter(names, &(&1 in settings.workflow_labels)) do
         {:ok, %{"status" => status, "label" => allowed_label}}
       else
         _ -> {:error, :github_unknown_payload}
@@ -75,7 +78,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   defp run("github_attach_draft_pr", %{"issue_number" => number, "pr_url" => url}, opts)
        when is_integer(number) and number > 0 and is_binary(url) do
     with {:ok, settings} <- tool_settings(opts),
-         :ok <- authorize_issue(number, settings, opts),
+         {:ok, _} <- authorize_issue(number, settings, opts),
          {:ok, pr_number} <- scoped_pr_number(url, settings.repo),
          {:ok,
           %{
@@ -105,10 +108,11 @@ defmodule SymphonyElixir.GitHub.AgentTool do
 
   defp upsert_workpad(number, body, opts) do
     with {:ok, settings} <- tool_settings(opts),
-         :ok <- authorize_issue(number, settings, opts),
+         {:ok, _} <- authorize_issue(number, settings, opts),
          {:ok, %{status: 200, body: comments}} <-
            request("GET", issue_path(settings, number) <> "/comments", %{"per_page" => 100}, nil, opts),
          {:ok, comment} <- owned_workpad(comments, settings.actor_id),
+         {:ok, _} <- authorize_issue(number, settings, opts),
          {:ok, %{status: status, body: response_body}} <- write_workpad(comment, number, body, settings, opts),
          true <- status in 200..299 or {:error, {:github_api_status, status}} do
       case response_body do
@@ -155,10 +159,22 @@ defmodule SymphonyElixir.GitHub.AgentTool do
          true <-
            (native_ref["issue_number"] == number and native_ref["repository"] == settings.repo and
               native_ref["repository_id"] == settings.repository_id and
-              native_ref["project_id"] == settings.project_id and present?(native_ref["project_item_id"]) and
-              present?(native_ref["issue_id"])) or {:error, :github_issue_context_mismatch} do
-      checker = Keyword.get(opts, :scope_checker, &Client.issue_in_scope?/2)
-      checker.(native_ref, Keyword.take(opts, [:tracker_settings]))
+              present?(native_ref["issue_id"]) and
+              Enum.sort(Map.keys(native_ref)) ==
+                ["issue_id", "issue_number", "repository", "repository_id"]) or
+             {:error, :github_issue_context_mismatch} do
+      checker_opts =
+        Keyword.take(opts, [:tracker_settings]) ++
+          if(Keyword.has_key?(opts, :github_client),
+            do: [
+              request_fun: fn method, path, params, body, _settings ->
+                request(method, path, params, body, opts)
+              end
+            ],
+            else: []
+          )
+
+      run_scope_checker(Keyword.get(opts, :scope_checker), native_ref, checker_opts, opts)
     else
       nil -> {:error, :missing_github_issue_context}
       {:error, _} = error -> error
@@ -166,30 +182,48 @@ defmodule SymphonyElixir.GitHub.AgentTool do
     end
   end
 
+  defp run_scope_checker(nil, native_ref, checker_opts, _opts),
+    do: Client.issue_snapshot(native_ref, checker_opts)
+
+  defp run_scope_checker(checker, native_ref, checker_opts, opts) do
+    with :ok <- checker.(native_ref, checker_opts), do: {:ok, Keyword.fetch!(opts, :issue)}
+  end
+
   defp allowed_label(labels, requested) do
-    case Enum.find(labels, &(normalize(&1) == normalize(requested))) do
-      nil -> {:error, :label_not_allowed}
-      label -> {:ok, label}
+    if requested in labels, do: {:ok, requested}, else: {:error, :label_not_allowed}
+  end
+
+  defp transition_labels(labels, workflow_labels, target) when is_list(labels) do
+    names =
+      Enum.map(labels, fn
+        name when is_binary(name) -> name
+        _ -> nil
+      end)
+
+    if Enum.any?(names, &is_nil/1) do
+      {:error, :github_unknown_payload}
+    else
+      {:ok, Enum.reject(names, &(&1 in workflow_labels)) ++ [target]}
     end
   end
+
+  defp transition_labels(_, _, _), do: {:error, :github_unknown_payload}
 
   defp tool_settings(opts) do
     case Keyword.get(opts, :tracker_settings) do
       %{provider: provider} when is_map(provider) ->
         with repo when is_binary(repo) <- provider["repo"],
              repository_id when is_binary(repository_id) <- provider["repository_id"],
-             project_id when is_binary(project_id) <- provider["project_id"],
              base_branch when is_binary(base_branch) <- provider["base_branch"],
              actor when is_binary(actor) <- provider["actor_id"],
              labels when is_list(labels) and labels != [] <- provider["workflow_labels"],
-             true <- Enum.all?([repo, repository_id, project_id, base_branch, actor], &present?/1),
+             true <- Enum.all?([repo, repository_id, base_branch, actor], &present?/1),
              true <- Enum.all?(labels, &present?/1),
              true <- Enum.uniq(Enum.map(labels, &normalize/1)) == Enum.map(labels, &normalize/1) do
           {:ok,
            %{
              repo: String.trim(repo),
              repository_id: String.trim(repository_id),
-             project_id: String.trim(project_id),
              base_branch: String.trim(base_branch),
              actor_id: String.trim(actor),
              workflow_labels: Enum.map(labels, &String.trim/1)
@@ -221,7 +255,6 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   defp issue_path(settings, number), do: "/repos/#{settings.repo}/issues/#{number}"
   defp workpad(body), do: @marker <> "\n" <> body
   defp normalize(value) when is_binary(value), do: value |> String.trim() |> String.downcase()
-  defp normalize(_), do: ""
   defp present?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp spec(name, description, properties, required),

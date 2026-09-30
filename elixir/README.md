@@ -248,40 +248,41 @@ codex:
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
 
-### GitHub Issues + Projects v2 adapter (compact pilot profile)
+### GitHub repository Issues adapter (compact pilot profile)
 
-The GitHub adapter is intentionally fail closed and supports exactly one GitHub.com repository and
-one Project v2. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete profile.
+The GitHub adapter is intentionally fail closed and supports exactly one GitHub.com repository.
+Any user-owned Project is a human-only, non-authoritative view: Symphony never queries or mutates
+GitHub Projects. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete profile.
 
-- Required stable scope: `repo`, `repository_id`, `project_id`, and `base_branch`. Symphony never discovers or
+- Required stable scope: `repo`, `repository_id`, and `base_branch`. Symphony never discovers or
   substitutes these identifiers and never falls back to `GITHUB_REPO`.
-- Required workflow metadata: `ready_label`, `status_field_id`, explicit `status_options`,
-  `ready_statuses`, `priority_field_id`, explicit integer `priority_options`, `workflow_labels`, and
-  the authenticated comment owner's `actor_id`. Missing, duplicate, or unknown fields/options fail
-  the entire read. Priority is deliberately required by this compact profile.
+- Workflow state comes only from exactly one of `symphony:ready`, `symphony:in-progress`,
+  `symphony:human-review`, or `symphony:done`. Priority comes only from exactly one of
+  `priority:p0`, `priority:p1`, or `priority:p2`. Missing, conflicting, malformed, or case-variant
+  labels fail closed.
 - Auth: `token` is required and may be a `$VAR_NAME` host-side reference. The example uses
   `$SYMPHONY_GITHUB_TOKEN`. Token values are removed from the Codex child environment and are not
-  included in prompts, logs, or tool results. Grant only repository metadata/issue read access,
-  Project read access, and issue comment/label write access.
-- Eligibility: only open Issue content in the exact configured repository and Project can dispatch.
-  Pull requests are skipped; draft/redacted items, incomplete nested pagination, ambiguous Project
-  membership, missing dependency data, unknown fields, and open blockers fail closed or make the
-  issue non-dispatchable. `issue.id` is the Project item node ID; issue, repository, Project, and
-  Project-item node IDs remain in `native_ref`.
-- Reliability: Project reads use cursor pagination with `max_pages` (default 20, maximum 100),
-  `timeout_ms` (default 30000), strict cursor checks, and explicit permission/rate-limit errors.
+  included in prompts, logs, or tool results. Use a fine-grained PAT limited to the selected
+  repository only, with Issues read/write, Pull requests read-only, Metadata read-only, and every
+  other permission disabled. Do not use a classic PAT or grant Project permissions.
+- Eligibility: only open issues carrying the exact `symphony:ready` label can dispatch. Pull
+  requests returned by issue APIs are skipped; open blockers make an issue non-dispatchable.
+  `issue.id` is the immutable issue node ID. `native_ref` contains only repository identity, issue
+  number, and issue node ID—never Project IDs, item IDs, field IDs, or option IDs.
+- Reliability: repository issue reads use bounded pagination (`max_pages`, default 20, maximum 100)
+  and explicit permission, rate-limit, malformed-payload, and dependency-pagination failures.
 - Mutations: Codex receives only `github_workpad`, `github_apply_workflow_label`, and
   `github_attach_draft_pr`. They can upsert one marker-owned workpad comment, apply one configured
   allowlisted label, and verify/attach an open Draft PR URL whose base repository and branch exactly
-  match the configured scope. Every mutation is bound to the current session's repository, Project,
-  Project-item, issue node, and issue number. Tool results contain only minimal IDs/status, not raw
+  match the configured scope. Before every mutation, Symphony re-fetches and checks the exact
+  repository identity, issue number/node ID, open state, workflow eligibility, blockers, and
+  session-bound identity. Tool results contain only minimal IDs/status, not raw
   provider bodies. There is no raw
-  REST/GraphQL tool and no delete, repository administration, branch protection, merge, or Project
-  mutation capability.
+  REST/GraphQL tool and no Contents, refs, branch-write, delete, repository administration, workflow,
+  ruleset, merge, or Project capability.
 
-The adapter assumes GitHub's `Issue.blockedBy` GraphQL connection is available to the token and
-fully readable. A complete labels, blockers, field-values, and single-assignee result must fit the
-documented nested bounds; otherwise polling fails instead of inferring eligibility.
+Git/SSH feature-branch pushes are a separate credential domain from the API PAT. Server-side rules
+must reject pushes to `main` and `staging`; a credential that can bypass those rules is a hard NO-GO.
 
 ### Jira Cloud adapter
 
@@ -367,31 +368,21 @@ The live test creates a temporary Linear project and issue, writes a temporary `
 a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
-The former generic GitHub Issues live test does not apply to the compact Projects v2 pilot profile.
-The replacement is an opt-in, fail-closed test that uses an already-provisioned dedicated pilot
-issue, Project item, allowlisted label, and open Draft PR. It never creates, closes, deletes, merges,
-or changes a branch. It updates only the dedicated issue's Symphony workpad and adds the configured
-workflow label:
+The opt-in, fail-closed GitHub test uses an already-provisioned dedicated issue and open Draft PR.
+It proves private issue reads, workpad create/update, allowlisted workflow transitions, Draft PR
+metadata reads, and the absence of Project, Contents/refs, administration, workflow, and merge
+authority. It never creates, closes, deletes, merges, or changes a branch:
 
 ```bash
 cd elixir
 export SYMPHONY_GITHUB_TOKEN=...
 export SYMPHONY_LIVE_GITHUB_REPO=owner/repo
 export SYMPHONY_LIVE_GITHUB_REPOSITORY_ID=R_...
-export SYMPHONY_LIVE_GITHUB_PROJECT_ID=PVT_...
-export SYMPHONY_LIVE_GITHUB_PROJECT_ITEM_ID=PVTI_...
 export SYMPHONY_LIVE_GITHUB_ISSUE_NUMBER=123
+export SYMPHONY_LIVE_GITHUB_ISSUE_NODE_ID=I_...
 export SYMPHONY_LIVE_GITHUB_BASE_BRANCH=staging
 export SYMPHONY_LIVE_GITHUB_DRAFT_PR_URL=https://github.com/owner/repo/pull/456
 export SYMPHONY_LIVE_GITHUB_ACTOR_ID=U_...
-export SYMPHONY_LIVE_GITHUB_READY_LABEL=symphony:ready
-export SYMPHONY_LIVE_GITHUB_WORKFLOW_LABEL=symphony:human-review
-export SYMPHONY_LIVE_GITHUB_STATUS_FIELD_ID=PVTF_...
-export SYMPHONY_LIVE_GITHUB_STATUS_OPTIONS='{"option-ready":"Ready","option-review":"Human Review"}'
-export SYMPHONY_LIVE_GITHUB_READY_STATUS=Ready
-export SYMPHONY_LIVE_GITHUB_TERMINAL_STATUS='Human Review'
-export SYMPHONY_LIVE_GITHUB_PRIORITY_FIELD_ID=PVTF_...
-export SYMPHONY_LIVE_GITHUB_PRIORITY_OPTIONS='{"option-p1":1}'
 SYMPHONY_RUN_GITHUB_PILOT_LIVE_E2E=1 \
   mix test test/symphony_elixir/github_pilot_live_e2e_test.exs
 ```
