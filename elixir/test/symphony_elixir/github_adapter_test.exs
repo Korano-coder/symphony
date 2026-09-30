@@ -1,453 +1,480 @@
-defmodule SymphonyElixir.GitHub.AdapterTest do
+defmodule SymphonyElixir.GitHubAdapterTest do
   use SymphonyElixir.TestSupport
+  alias SymphonyElixir.GitHub.{Adapter, AgentTool, Client}
+  alias SymphonyElixir.Tracker.Issue
 
-  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
-  alias SymphonyElixir.GitHub.AgentTool, as: GitHubAgentTool
-  alias SymphonyElixir.GitHub.Client, as: GitHubClient
-
-  defmodule FakeGitHubClient do
-    def fetch_issues_by_states(states) do
-      send(self(), {:github_states_called, states})
-      {:ok, states}
-    end
-
-    def fetch_issues_by_ids(ids) do
-      send(self(), {:github_ids_called, ids})
-      {:ok, ids}
-    end
+  defmodule FakeClient do
+    def fetch_issues_by_states(states), do: {:ok, states}
+    def fetch_issues_by_ids(ids), do: {:ok, ids}
   end
 
-  setup do
-    github_client_module = Application.get_env(:symphony_elixir, :github_client_module)
+  test "validates repository label profile and constrained tools" do
+    assert :ok = Adapter.validate_config(settings())
+    assert {:error, :missing_github_repository_id} = Adapter.validate_config(settings(%{"repository_id" => nil}))
+    assert {:error, :invalid_github_workflow_labels} = Adapter.validate_config(settings(%{"workflow_labels" => ["symphony:ready"]}))
+    assert {:error, :invalid_github_priority_labels} = Adapter.validate_config(settings(%{"priority_labels" => ["priority:p0"]}))
 
-    on_exit(fn ->
-      if is_nil(github_client_module) do
-        Application.delete_env(:symphony_elixir, :github_client_module)
-      else
-        Application.put_env(:symphony_elixir, :github_client_module, github_client_module)
-      end
-    end)
+    for project_settings <- [
+          settings(%{"project_id" => "PVT_1"}),
+          Map.put(settings(), :project_id, "PVT_1"),
+          settings(%{"extension" => %{"project_number" => 1}}),
+          settings(%{project_ref: "PVT_1"})
+        ] do
+      assert {:error, :github_project_configuration_not_allowed} = Adapter.validate_config(project_settings)
+    end
 
-    :ok
-  end
-
-  test "adapter validates GitHub config, delegates reads, and advertises github_api" do
-    settings = tracker_settings()
-
-    assert :ok = GitHubAdapter.validate_config(settings)
+    assert {:error, :missing_github_ready_label_gate} = Adapter.validate_config(%{settings() | required_labels: []})
+    assert Enum.map(Adapter.agent_tool_specs(), & &1["name"]) == ["github_workpad", "github_apply_workflow_label", "github_attach_draft_pr"]
+    refute Enum.any?(Adapter.agent_tool_specs(), &(&1["name"] == "github_api"))
+    refute Enum.any?(Adapter.agent_tool_specs(), &String.contains?(String.downcase(&1["name"]), "project"))
+    assert "PILOT_GITHUB_TOKEN" in Client.secret_environment_names(settings(%{"token" => "$PILOT_GITHUB_TOKEN"}))
 
     assert {:error, :missing_github_active_states} =
-             GitHubAdapter.validate_config(%{settings | active_states: nil})
-
-    assert {:error, :missing_github_terminal_states} =
-             GitHubAdapter.validate_config(%{settings | terminal_states: nil})
-
-    assert :ok = GitHubAdapter.validate_config(%{settings | active_states: [], terminal_states: []})
+             Adapter.validate_config(%{settings() | active_states: nil})
 
     assert {:error, :invalid_github_states} =
-             GitHubAdapter.validate_config(%{settings | active_states: ["Todo"]})
+             Adapter.validate_config(%{settings() | terminal_states: [123]})
 
-    assert {:error, :invalid_github_states} =
-             GitHubAdapter.validate_config(%{settings | active_states: [42]})
-
-    assert {:error, :invalid_github_states} =
-             GitHubAdapter.validate_config(%{settings | active_states: ["closed"]})
-
-    assert {:error, :invalid_github_states} =
-             GitHubAdapter.validate_config(%{settings | terminal_states: ["open"]})
-
-    Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
-
-    assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"])
-    assert_receive {:github_states_called, ["open"]}
-
-    assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"])
-    assert_receive {:github_ids_called, ["42"]}
-
-    assert [%{"name" => "github_api"}] = GitHubAdapter.agent_tool_specs()
-
-    assert GitHubAdapter.execute_agent_tool(
-             "github_api",
-             %{"method" => "GET", "path" => "/user"},
-             github_client: fn _method, _path, _params, _body, _opts ->
-               {:ok, %{status: 200, body: %{"login" => "octocat"}}}
-             end
-           )["success"]
+    assert {:error, :missing_github_ready_label_gate} =
+             Adapter.validate_config(Map.delete(settings(), :required_labels))
   end
 
-  test "client validates repository settings and declares token environments" do
-    assert :ok = GitHubClient.validate_settings(tracker_settings())
+  test "adapter delegates reads, tools, and secret names" do
+    previous = Application.get_env(:symphony_elixir, :github_client_module)
+    Application.put_env(:symphony_elixir, :github_client_module, FakeClient)
 
-    assert {:error, :missing_github_repo} =
-             GitHubClient.validate_settings(tracker_settings(%{"repo" => 123}))
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:symphony_elixir, :github_client_module, previous),
+        else: Application.delete_env(:symphony_elixir, :github_client_module)
+    end)
 
-    assert {:error, :invalid_github_repo} =
-             GitHubClient.validate_settings(tracker_settings(%{"repo" => "not-a-repo"}))
-
-    assert {:error, :missing_github_token} =
-             GitHubClient.validate_settings(tracker_settings(%{"token" => 123}))
-
-    assert {:error, :invalid_github_api_url} =
-             GitHubClient.validate_settings(tracker_settings(%{"api_url" => "not a url"}))
-
-    assert {:error, :invalid_github_api_url} =
-             GitHubClient.validate_settings(tracker_settings(%{"api_url" => "http://api.github.com"}))
-
-    assert GitHubClient.secret_environment_names(tracker_settings(%{"token" => "$SYMPHONY_GITHUB_TOKEN"})) == [
-             "GITHUB_TOKEN",
-             "GH_TOKEN",
-             "GITHUB_ENTERPRISE_TOKEN",
-             "GH_ENTERPRISE_TOKEN",
-             "SYMPHONY_GITHUB_TOKEN"
-           ]
+    assert {:ok, ["ready"]} = Adapter.fetch_issues_by_states(["ready"])
+    assert {:ok, ["I_42"]} = Adapter.fetch_issues_by_ids(["I_42"])
+    refute Adapter.execute_agent_tool("unknown", %{}, [])["success"]
+    assert "GITHUB_TOKEN" in Adapter.secret_environment_names(settings())
   end
 
-  test "client normalizes GitHub issues without dropping provider details" do
-    issue = GitHubClient.normalize_issue_for_test(raw_issue(42), "octo/repo")
-
-    assert issue.id == "42"
-    assert issue.identifier == "GH-42"
-
-    assert issue.native_ref == %{
-             "id" => 1_042,
-             "node_id" => "I_42",
-             "number" => 42,
-             "repo" => "octo/repo"
-           }
-
-    assert issue.title == "Issue 42"
-    assert issue.description == "Body 42"
-    assert issue.state == "open"
-    assert issue.url == "https://github.test/octo/repo/issues/42"
-    assert issue.assignee_id == "octocat"
-    assert issue.labels == ["bug", "platform"]
-    assert issue.blocked_by == []
-    assert issue.dispatchable
-    assert %DateTime{} = issue.created_at
-    assert %DateTime{} = issue.updated_at
-
-    refute GitHubClient.normalize_issue_for_test(
-             Map.put(raw_issue(43), "pull_request", %{"url" => "https://api.github.test/pulls/43"}),
-             "octo/repo"
-           ).dispatchable
-
-    assert GitHubClient.normalize_issue_for_test(
-             Map.put(raw_issue(44), "title", " "),
-             "octo/repo"
-           ) == nil
+  test "polls only configured repository, excludes PRs, and reads exact labels" do
+    request = polling_client([raw_issue(), raw_issue(43, %{"pull_request" => %{"url" => "x"}})])
+    assert {:ok, [issue]} = Client.fetch_for_test(["symphony:ready"], nil, settings(), request)
+    assert {issue.id, issue.priority, issue.state, issue.dispatchable} == {"I_42", 1, "symphony:ready", true}
+    assert issue.native_ref == %{"repository" => "owner/repo", "repository_id" => "R_repo", "issue_id" => "I_42", "issue_number" => 42}
+    refute Enum.any?(Map.keys(issue.native_ref), &String.contains?(&1, "project"))
   end
 
-  test "client pages state reads, filters requested states, and drops malformed records" do
-    first_page =
-      Enum.map(1..97, &raw_issue/1) ++
-        [
-          Map.put(raw_issue(98), "pull_request", %{"url" => "https://api.github.test/pulls/98"}),
-          Map.put(raw_issue(99), "state", "closed"),
-          Map.put(raw_issue(100), "title", "")
-        ]
+  test "explicit ID lookup ignores ordinary repository issues before the requested issue" do
+    ordinary = Enum.map(1..75, &ordinary_issue/1)
+    request = polling_client(ordinary ++ [raw_issue(759)])
 
-    request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, settings ->
-      send(self(), {:github_page, params, settings})
+    assert {:ok, [issue]} =
+             Client.fetch_for_test(["symphony:ready"], ["I_759"], settings(), request)
 
-      body =
-        case params["page"] do
-          1 -> first_page
-          2 -> [raw_issue(101)]
-        end
+    assert issue.id == "I_759"
+  end
 
-      {:ok, %{status: 200, body: body}}
+  test "ready-state polling ignores ordinary issues without Symphony workflow labels" do
+    request = polling_client(Enum.map(1..75, &ordinary_issue/1) ++ [raw_issue(759)])
+
+    assert {:ok, [issue]} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), request)
+
+    assert issue.id == "I_759"
+  end
+
+  test "actual Symphony candidates still fail closed for malformed and conflicting labels" do
+    malformed = put_in(raw_issue(), ["labels"], [%{"name" => "symphony:ready"}, %{}])
+    conflicting = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "symphony:done", "priority:p1"]))
+
+    assert {:error, :github_malformed_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([malformed]))
+
+    assert {:error, :github_conflicting_workflow_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([conflicting]))
+  end
+
+  test "pagination is bounded" do
+    endless = fn
+      "GET", "/repos/owner/repo", _, _, _ -> {:ok, %{status: 200, body: repository()}}
+      "GET", "/repos/owner/repo/issues", _, _, _ -> {:ok, %{status: 200, body: Enum.map(1..100, &raw_issue(&1 + 100))}}
+      "GET", _, _, _, _ -> {:ok, %{status: 200, body: []}}
     end
 
-    log =
-      capture_log(fn ->
-        assert {:ok, issues} =
-                 GitHubClient.fetch_issues_by_states_for_test(
-                   [" OPEN "],
-                   tracker_settings(),
-                   request_fun
-                 )
-
-        assert length(issues) == 99
-        assert hd(issues).id == "1"
-        assert List.last(issues).id == "101"
-        refute Enum.any?(issues, &(&1.id == "99"))
-        assert Enum.find(issues, &(&1.id == "98")).dispatchable == false
-      end)
-
-    assert log =~ "Dropping malformed GitHub issue records count=1"
-
-    assert_receive {:github_page,
-                    %{
-                      "state" => "open",
-                      "per_page" => 100,
-                      "page" => 1,
-                      "sort" => "created",
-                      "direction" => "asc"
-                    }, %{repo: "octo/repo"}}
-
-    assert_receive {:github_page, %{"page" => 2}, %{repo: "octo/repo"}}
-
-    assert {:ok, []} =
-             GitHubClient.fetch_issues_by_states_for_test(
-               ["In Progress"],
-               tracker_settings(),
-               fn _method, _path, _params, _body, _settings ->
-                 flunk("unsupported GitHub states should not make an HTTP request")
-               end
-             )
+    assert {:error, :github_pagination_limit} = Client.fetch_for_test(["symphony:ready"], nil, settings(%{"max_pages" => 1}), endless)
   end
 
-  test "client refreshes numeric IDs in order, omits 404s, and rejects malformed refreshes" do
-    request_fun = fn "GET", path, %{}, nil, _settings ->
-      send(self(), {:github_id_path, path})
+  test "pagination follows every repository issue page" do
+    request = fn
+      "GET", "/repos/owner/repo", _, _, _ ->
+        {:ok, %{status: 200, body: repository()}}
 
-      case path do
-        "/repos/octo/repo/issues/2" -> {:ok, %{status: 200, body: raw_issue(2)}}
-        "/repos/octo/repo/issues/1" -> {:ok, %{status: 200, body: raw_issue(1)}}
-        "/repos/octo/repo/issues/404" -> {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
-      end
+      "GET", "/repos/owner/repo/issues", %{"page" => 1}, _, _ ->
+        {:ok, %{status: 200, body: Enum.map(1..100, &raw_issue/1)}}
+
+      "GET", "/repos/owner/repo/issues", %{"page" => 2}, _, _ ->
+        {:ok, %{status: 200, body: [raw_issue(101)]}}
+
+      "GET", path, _, _, _ ->
+        if String.ends_with?(path, "/dependencies/blocked_by"),
+          do: {:ok, %{status: 200, body: []}},
+          else: {:ok, %{status: 404, body: %{}}}
     end
 
     assert {:ok, issues} =
-             GitHubClient.fetch_issues_by_ids_for_test(
-               ["2", "1", "404", "2"],
-               tracker_settings(),
-               request_fun
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), request)
+
+    assert length(issues) == 101
+  end
+
+  test "explicit lookup traverses ordinary pages and rejects duplicate candidates" do
+    request = fn
+      "GET", "/repos/owner/repo", _, _, _ ->
+        {:ok, %{status: 200, body: repository()}}
+
+      "GET", "/repos/owner/repo/issues", %{"page" => 1}, _, _ ->
+        {:ok, %{status: 200, body: Enum.map(1..100, &ordinary_issue/1)}}
+
+      "GET", "/repos/owner/repo/issues", %{"page" => 2}, _, _ ->
+        {:ok, %{status: 200, body: [raw_issue(759), raw_issue(759)]}}
+
+      "GET", path, _, _, _ ->
+        if String.ends_with?(path, "/dependencies/blocked_by"),
+          do: {:ok, %{status: 200, body: []}},
+          else: {:ok, %{status: 404, body: %{}}}
+    end
+
+    assert {:error, :github_ambiguous_issue} =
+             Client.fetch_for_test(["symphony:ready"], ["I_759"], settings(), request)
+  end
+
+  test "fails closed for exact labels, conflicts, blockers, malformed data, and denial" do
+    wrong_case = put_in(raw_issue(), ["labels"], labels(["Symphony:Ready", "priority:p1"]))
+    conflict = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "symphony:done", "priority:p1"]))
+    priorities = put_in(raw_issue(), ["labels"], labels(["symphony:ready", "priority:p0", "priority:p1"]))
+
+    assert {:ok, []} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([wrong_case]))
+
+    assert {:error, :github_missing_workflow_label} =
+             Client.fetch_for_test(["symphony:ready"], ["I_42"], settings(), polling_client([wrong_case]))
+
+    assert {:error, :github_conflicting_workflow_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([conflict]))
+
+    assert {:error, :github_conflicting_priority_labels} =
+             Client.fetch_for_test(["symphony:ready"], nil, settings(), polling_client([priorities]))
+
+    assert {:ok, [issue]} =
+             Client.fetch_for_test(
+               ["symphony:ready"],
+               nil,
+               settings(),
+               polling_client([raw_issue()], [blocker()])
              )
 
-    assert Enum.map(issues, & &1.id) == ["2", "1"]
-    assert_receive {:github_id_path, "/repos/octo/repo/issues/2"}
-    assert_receive {:github_id_path, "/repos/octo/repo/issues/1"}
-    assert_receive {:github_id_path, "/repos/octo/repo/issues/404"}
-    refute_receive {:github_id_path, "/repos/octo/repo/issues/2"}
-
-    assert {:error, :invalid_github_issue_id} =
-             GitHubClient.fetch_issues_by_ids_for_test(
-               ["not-a-number"],
-               tracker_settings(),
-               request_fun
-             )
-
-    assert {:error, :github_unknown_payload} =
-             GitHubClient.fetch_issues_by_ids_for_test(
-               ["3"],
-               tracker_settings(),
-               fn _method, _path, _params, _body, _settings ->
-                 {:ok, %{status: 200, body: Map.put(raw_issue(3), "title", "")}}
-               end
-             )
+    refute issue.dispatchable
+    denied = fn "GET", "/repos/owner/repo", _, _, _ -> {:ok, %{status: 403, body: %{}}} end
+    assert {:error, {:github_permission_denied, 403}} = Client.fetch_for_test(["symphony:ready"], nil, settings(), denied)
   end
 
-  test "github_api preserves REST status and body while rejecting unsafe arguments" do
-    test_pid = self()
-    tracker_settings = tracker_settings()
+  test "all mutations reject stale, mismatched, or unauthorized session identity" do
+    no_write = fn _, _, _, _, _ -> flunk("must not mutate") end
 
-    response =
-      GitHubAgentTool.execute(
-        "github_api",
-        %{
-          "method" => "post",
-          "path" => " /repos/octo/repo/issues/42/comments ",
-          "params" => %{"per_page" => 10},
-          "body" => %{"body" => "hello"}
-        },
-        tracker_settings: tracker_settings,
-        github_client: fn method, path, params, body, opts ->
-          send(test_pid, {:github_tool_called, method, path, params, body, opts})
-          {:ok, %{status: 201, body: %{"id" => 9}}}
-        end
-      )
+    opts = [
+      tracker_settings: settings(),
+      github_client: no_write,
+      scope_checker: fn _, _ -> {:error, :github_issue_not_eligible} end,
+      issue: issue()
+    ]
 
-    assert_received {:github_tool_called, "POST", "/repos/octo/repo/issues/42/comments", %{"per_page" => 10}, %{"body" => "hello"}, [tracker_settings: ^tracker_settings]}
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, opts)["success"]
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 43, "body" => "x"}, tool_opts(no_write))["success"]
+    wrong = put_in(issue().native_ref["repository_id"], "R_other")
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, Keyword.put(opts, :issue, wrong))["success"]
+  end
 
-    assert response["success"] == true
-    assert Jason.decode!(response["output"]) == %{"status" => 201, "body" => %{"id" => 9}}
-    assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
+  test "real revalidation rejects PR, repository, number, and node identity mismatches" do
+    native_ref = issue().native_ref
 
-    failure =
-      GitHubAgentTool.execute(
-        "github_api",
-        %{"method" => "GET", "path" => "/repos/octo/repo/issues/404"},
-        github_client: fn _method, _path, _params, _body, _opts ->
-          {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
-        end
-      )
+    for changed <- [
+          Map.put(raw_issue(), "pull_request", %{"url" => "x"}),
+          Map.put(raw_issue(), "repository_url", "https://api.github.com/repos/other/repo"),
+          Map.put(raw_issue(), "number", 43),
+          Map.put(raw_issue(), "node_id", "I_other")
+        ] do
+      request = fn
+        "GET", "/repos/owner/repo", _, _, _ ->
+          {:ok, %{status: 200, body: repository()}}
 
-    assert failure["success"] == false
+        "GET", "/repos/owner/repo/issues/42", _, _, _ ->
+          {:ok, %{status: 200, body: changed}}
 
-    assert Jason.decode!(failure["output"]) == %{
-             "status" => 404,
-             "body" => %{"message" => "Not Found"}
-           }
-
-    Enum.each(
-      [
-        %{"method" => "GET", "path" => "https://api.github.com/user"},
-        %{"method" => "GET", "path" => "/user", "params" => false},
-        %{"path" => "/user"}
-      ],
-      fn arguments ->
-        invalid =
-          GitHubAgentTool.execute(
-            "github_api",
-            arguments,
-            github_client: fn _method, _path, _params, _body, _opts ->
-              flunk("invalid github_api arguments should not call the client")
-            end
-          )
-
-        assert invalid["success"] == false
+        "GET", path, _, _, _ ->
+          if String.ends_with?(path, "/dependencies/blocked_by"),
+            do: {:ok, %{status: 200, body: []}},
+            else: {:ok, %{status: 404, body: %{}}}
       end
-    )
+
+      assert {:error, _} =
+               Client.issue_snapshot(native_ref,
+                 tracker_settings: settings(),
+                 request_fun: request
+               )
+    end
   end
 
-  test "github_api reports unsupported tools, malformed calls, and client failures" do
-    unsupported = GitHubAgentTool.execute("not_github_api", %{}, [])
-    assert unsupported["success"] == false
-    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api"]
+  test "workpad updates only one exact marker owned by configured actor" do
+    client =
+      mutation_client([
+        %{"id" => 8, "body" => "ordinary", "user" => %{"node_id" => "U_other"}},
+        %{"id" => 9, "body" => "<!-- symphony-workpad:v1 -->\nold", "user" => %{"node_id" => "U_actor"}}
+      ])
 
-    Enum.each(
-      [
-        "not-an-object",
-        %{"method" => "GET", "path" => 123}
-      ],
-      fn arguments ->
-        invalid =
-          GitHubAgentTool.execute(
-            "github_api",
-            arguments,
-            github_client: fn _method, _path, _params, _body, _opts ->
-              flunk("malformed github_api arguments should not call the client")
-            end
-          )
+    assert AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "new"}, tool_opts(client))["success"]
+    assert_received {:mutation, "PATCH", "/repos/owner/repo/issues/comments/9", %{"body" => "<!-- symphony-workpad:v1 -->\nnew"}}
 
-        assert invalid["success"] == false
+    ambiguous = [
+      %{"id" => 1, "body" => "<!-- symphony-workpad:v1 -->", "user" => %{"node_id" => "U_actor"}},
+      %{"id" => 2, "body" => "<!-- symphony-workpad:v1 -->", "user" => %{"node_id" => "U_actor"}}
+    ]
+
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tool_opts(mutation_client(ambiguous)))["success"]
+  end
+
+  test "workflow transition preserves ordinary labels and replaces Symphony label" do
+    client = mutation_client([])
+    assert AgentTool.execute("github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:in-progress"}, tool_opts(client))["success"]
+    assert_received {:mutation, "PATCH", "/repos/owner/repo/issues/42", %{"labels" => ["priority:p1", "component:api", "symphony:in-progress"]}}
+    refute AgentTool.execute("github_apply_workflow_label", %{"issue_number" => 42, "label" => "Symphony:done"}, tool_opts(client))["success"]
+  end
+
+  test "Draft PR must be open Draft in exact repository and base branch" do
+    url = "https://github.com/owner/repo/pull/7"
+    assert AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => url}, tool_opts(mutation_client([])))["success"]
+    refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => "https://github.com/other/repo/pull/7"}, tool_opts(mutation_client([])))["success"]
+    refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => url}, tool_opts(mutation_client([], %{"draft" => false})))["success"]
+  end
+
+  test "REST allowlist excludes contents, refs, admin, merge, Projects, and redacts secrets" do
+    no_call = fn _, _, _, _, _ -> flunk("denied route") end
+
+    for {method, path} <- [
+          {"GET", "/repos/owner/repo/contents/x"},
+          {"POST", "/repos/owner/repo/git/refs"},
+          {"PATCH", "/repos/owner/repo/branches/main/protection"},
+          {"PUT", "/repos/owner/repo/pulls/7/merge"},
+          {"POST", "/graphql"}
+        ] do
+      assert {:error, :github_scope_violation} = Client.rest(method, path, %{}, nil, tracker_settings: settings(), request_fun: no_call)
+    end
+
+    token = "super-secret-token"
+    output = AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tracker_settings: settings(%{"token" => token}))["output"]
+    refute String.contains?(output, token)
+  end
+
+  test "adapter and agent tools reject Project-shaped access" do
+    no_call = fn _, _, _, _, _ -> flunk("Project-shaped request reached GitHub") end
+
+    assert {:error, :github_scope_violation} =
+             Client.rest("GET", "/graphql", %{"query" => "query { viewer { projectsV2(first: 1) { totalCount } } }"}, nil, tracker_settings: settings(), request_fun: no_call)
+
+    for tool <- ["github_project", "github_projects_v2", "github_project_mutation"] do
+      refute AgentTool.execute(tool, %{}, tool_opts(no_call))["success"]
+    end
+
+    for {tool, arguments} <- [
+          {"github_workpad", %{"issue_number" => 42, "body" => "x", "project_id" => "PVT_1"}},
+          {"github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:done", "project_number" => 1}},
+          {"github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => "https://github.com/owner/repo/pull/7", "project_item_id" => "PVTI_1"}}
+        ] do
+      refute AgentTool.execute(tool, arguments, tool_opts(no_call))["success"]
+    end
+  end
+
+  test "mutation tools fail closed for malformed inputs and responses" do
+    refute AgentTool.execute("unknown", %{}, [])["success"]
+    refute AgentTool.execute("github_workpad", %{}, tool_opts(mutation_client([])))["success"]
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => 123}, tool_opts(mutation_client([])))["success"]
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, [])["success"]
+
+    crowded = mutation_client(List.duplicate(%{}, 100))
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tool_opts(crowded))["success"]
+
+    malformed_comment =
+      mutation_client([
+        %{"id" => "bad", "body" => "<!-- symphony-workpad:v1 -->", "user" => %{"node_id" => "U_actor"}}
+      ])
+
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tool_opts(malformed_comment))["success"]
+
+    malformed = fn method, path, params, body, opts ->
+      case {method, path} do
+        {"GET", "/repos/owner/repo/issues/42"} -> {:ok, %{status: 200, body: %{"labels" => [%{}]}}}
+        _ -> mutation_client([]).(method, path, params, body, opts)
       end
-    )
+    end
 
-    malformed_response =
-      GitHubAgentTool.execute(
-        "github_api",
-        %{"method" => "GET", "path" => "/user"},
-        github_client: fn _method, _path, _params, _body, _opts ->
-          {:ok, %{status: "not-an-integer", body: %{}}}
-        end
-      )
+    refute AgentTool.execute("github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:done"}, tool_opts(malformed))["success"]
 
-    assert malformed_response["success"] == false
+    url = "https://github.com/owner/repo/pull/nope"
+    refute AgentTool.execute("github_attach_draft_pr", %{"issue_number" => 42, "pr_url" => url}, tool_opts(mutation_client([])))["success"]
 
-    Enum.each(
-      [
-        :missing_github_token,
-        {:github_api_request, :timeout},
-        :unexpected_failure
-      ],
-      fn reason ->
-        failure =
-          GitHubAgentTool.execute(
-            "github_api",
-            %{"method" => "GET", "path" => "/user"},
-            github_client: fn _method, _path, _params, _body, _opts ->
-              {:error, reason}
-            end
-          )
+    malformed_issue = Keyword.put(tool_opts(mutation_client([])), :issue, %{})
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, malformed_issue)["success"]
 
-        assert failure["success"] == false
-        assert %{"error" => %{"message" => message}} = Jason.decode!(failure["output"])
-        assert is_binary(message)
+    for bad_labels <- [nil, [%{}]] do
+      bad_issue = %{issue() | labels: bad_labels}
+
+      opts = [
+        tracker_settings: settings(),
+        github_client: mutation_client([]),
+        scope_checker: fn _, _ -> :ok end,
+        issue: bad_issue
+      ]
+
+      refute AgentTool.execute("github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:done"}, opts)["success"]
+    end
+
+    bad_write = fn method, path, params, body, opts ->
+      if method in ["POST", "PATCH"] and String.contains?(path, "/comments") do
+        {:ok, %{status: 200, body: %{}}}
+      else
+        mutation_client([]).(method, path, params, body, opts)
       end
-    )
+    end
 
-    non_json_body =
-      GitHubAgentTool.execute(
-        "github_api",
-        %{"method" => "GET", "path" => "/user"},
-        github_client: fn _method, _path, _params, _body, _opts ->
-          {:ok, %{status: 200, body: self()}}
-        end
-      )
+    refute AgentTool.execute("github_workpad", %{"issue_number" => 42, "body" => "x"}, tool_opts(bad_write))["success"]
 
-    assert non_json_body["success"]
-    assert non_json_body["output"] =~ "#PID"
+    bad_label_write = fn method, path, params, body, opts ->
+      if method == "PATCH" and path == "/repos/owner/repo/issues/42" do
+        {:ok, %{status: 200, body: %{}}}
+      else
+        mutation_client([]).(method, path, params, body, opts)
+      end
+    end
+
+    refute AgentTool.execute("github_apply_workflow_label", %{"issue_number" => 42, "label" => "symphony:done"}, tool_opts(bad_label_write))["success"]
   end
 
-  test "tracker binds GitHub tools and token env names from provider config" do
-    token_env = "SYMPHONY_GITHUB_TOKEN_#{System.unique_integer([:positive])}"
-    previous_token = System.get_env(token_env)
-    System.put_env(token_env, "test-token")
-
-    on_exit(fn -> restore_env(token_env, previous_token) end)
-
-    write_github_workflow!(Workflow.workflow_file_path(), "$#{token_env}")
-
-    binding = Tracker.bind_agent_tools()
-
-    assert binding.adapter == GitHubAdapter
-
-    assert binding.secret_environment_names == [
-             "GITHUB_TOKEN",
-             "GH_TOKEN",
-             "GITHUB_ENTERPRISE_TOKEN",
-             "GH_ENTERPRISE_TOKEN",
-             token_env
-           ]
-
-    assert [%{"name" => "github_api"}] = binding.tool_specs
-    assert :ok = Config.validate!()
-  end
-
-  defp tracker_settings(provider_overrides \\ %{}) do
+  defp settings(overrides \\ %{}) do
     %{
       kind: "github",
+      required_labels: ["symphony:ready"],
+      active_states: ["symphony:ready", "symphony:in-progress"],
+      terminal_states: ["symphony:human-review", "symphony:done"],
       provider:
         Map.merge(
           %{
-            "repo" => "octo/repo",
+            "repo" => "owner/repo",
+            "repository_id" => "R_repo",
+            "base_branch" => "staging",
+            "workflow_labels" => ~w(symphony:ready symphony:in-progress symphony:human-review symphony:done),
+            "priority_labels" => ~w(priority:p0 priority:p1 priority:p2),
+            "actor_id" => "U_actor",
             "token" => "test-token"
           },
-          provider_overrides
-        ),
-      active_states: ["open"],
-      terminal_states: ["closed"]
+          overrides
+        )
     }
   end
 
-  defp raw_issue(number) do
+  defp repository, do: %{"node_id" => "R_repo", "full_name" => "owner/repo"}
+  defp labels(names), do: Enum.map(names, &%{"name" => &1})
+
+  defp raw_issue(number \\ 42, extra \\ %{}),
+    do:
+      Map.merge(
+        %{
+          "node_id" => "I_#{number}",
+          "number" => number,
+          "title" => "Issue #{number}",
+          "body" => "private body",
+          "state" => "open",
+          "html_url" => "https://github.com/owner/repo/issues/#{number}",
+          "repository_url" => "https://api.github.com/repos/owner/repo",
+          "created_at" => "2026-01-01T00:00:00Z",
+          "updated_at" => "2026-01-02T00:00:00Z",
+          "assignee" => nil,
+          "labels" => labels(["symphony:ready", "priority:p1", "component:api"])
+        },
+        extra
+      )
+
+  defp ordinary_issue(number),
+    do: raw_issue(number, %{"labels" => labels(["bug", "priority:p2"])})
+
+  defp blocker do
     %{
-      "number" => number,
-      "id" => 1_000 + number,
-      "node_id" => "I_#{number}",
-      "title" => "Issue #{number}",
-      "body" => "Body #{number}",
+      "node_id" => "I_5",
+      "number" => 5,
       "state" => "open",
-      "html_url" => "https://github.test/octo/repo/issues/#{number}",
-      "assignee" => %{"login" => "octocat"},
-      "labels" => [%{"name" => " Bug "}, %{"name" => "bug"}, %{"name" => "Platform"}],
-      "created_at" => "2026-01-01T00:00:00Z",
-      "updated_at" => "2026-01-02T00:00:00Z"
+      "repository_url" => "https://api.github.com/repos/owner/repo"
     }
   end
 
-  defp write_github_workflow!(path, token) do
-    File.write!(
-      path,
-      """
-      ---
-      tracker:
-        kind: github
-        provider:
-          repo: "octo/repo"
-          token: #{Jason.encode!(token)}
-        active_states: ["open"]
-        terminal_states: ["closed"]
-      ---
+  defp polling_client(nodes, blockers \\ []),
+    do: fn
+      "GET", "/repos/owner/repo", _, _, _ ->
+        {:ok, %{status: 200, body: repository()}}
 
-      You are working on {{ issue.identifier }}.
-      """
-    )
+      "GET", "/repos/owner/repo/issues", _, _, _ ->
+        {:ok, %{status: 200, body: nodes}}
 
-    if Process.whereis(SymphonyElixir.WorkflowStore) do
-      assert :ok = SymphonyElixir.WorkflowStore.force_reload()
+      "GET", path, _, _, _ ->
+        if String.ends_with?(path, "/dependencies/blocked_by"),
+          do: {:ok, %{status: 200, body: blockers}},
+          else: {:ok, %{status: 404, body: %{}}}
     end
-  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp mutation_client(comments, pr_overrides \\ %{}),
+    do: fn method, path, _params, body, _opts ->
+      cond do
+        method == "GET" and path == "/repos/owner/repo" ->
+          {:ok, %{status: 200, body: repository()}}
+
+        method == "GET" and path == "/repos/owner/repo/issues/42" ->
+          {:ok, %{status: 200, body: raw_issue()}}
+
+        method == "GET" and String.ends_with?(path, "/dependencies/blocked_by") ->
+          {:ok, %{status: 200, body: []}}
+
+        method == "GET" and String.ends_with?(path, "/comments") ->
+          {:ok, %{status: 200, body: comments}}
+
+        method == "GET" and path == "/repos/owner/repo/pulls/7" ->
+          {:ok,
+           %{
+             status: 200,
+             body:
+               Map.merge(
+                 %{
+                   "draft" => true,
+                   "state" => "open",
+                   "html_url" => "https://github.com/owner/repo/pull/7",
+                   "base" => %{"ref" => "staging", "repo" => %{"full_name" => "owner/repo"}}
+                 },
+                 pr_overrides
+               )
+           }}
+
+        method in ["POST", "PATCH"] ->
+          send(self(), {:mutation, method, path, body})
+          {:ok, %{status: 200, body: if(path == "/repos/owner/repo/issues/42", do: %{"labels" => labels(body["labels"])}, else: %{"id" => 9})}}
+      end
+    end
+
+  defp issue,
+    do: %Issue{
+      id: "I_42",
+      identifier: "GH-42",
+      title: "Issue 42",
+      state: "symphony:ready",
+      dispatchable: true,
+      labels: ["symphony:ready", "priority:p1", "component:api"],
+      native_ref: %{"repository" => "owner/repo", "repository_id" => "R_repo", "issue_id" => "I_42", "issue_number" => 42}
+    }
+
+  defp tool_opts(client), do: [tracker_settings: settings(), github_client: client, issue: issue()]
 end

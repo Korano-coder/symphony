@@ -22,7 +22,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear serves `linear_graphql`, GitHub serves three constrained pilot tools, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
@@ -248,19 +248,41 @@ codex:
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
 
-### GitHub Issues adapter
+### GitHub repository Issues adapter (compact pilot profile)
 
-- Config: use `tracker.kind: github` with required `tracker.provider.repo` in `owner/repo` form,
-  optional `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`), and optional `api_url`
-  (default `https://api.github.com`, HTTPS only). Set explicit `active_states` and
-  `terminal_states`; active entries may be `open` and terminal entries may be `closed`.
-- Reads and identity: polling is scoped to the configured repository; `issue.id` is the
-  repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
-  omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
-- Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
-  `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
-  credentials and provider authentication aliases from the Codex child, and leaves raw tool access
-  limited by that token's GitHub permissions.
+The GitHub adapter is intentionally fail closed and supports exactly one GitHub.com repository.
+Any user-owned Project is a human-only, non-authoritative view: Symphony never queries or mutates
+GitHub Projects. See [`WORKFLOW.github.md`](WORKFLOW.github.md) for the complete profile.
+
+- Required stable scope: `repo`, `repository_id`, and `base_branch`. Symphony never discovers or
+  substitutes these identifiers and never falls back to `GITHUB_REPO`.
+- Workflow state comes only from exactly one of `symphony:ready`, `symphony:in-progress`,
+  `symphony:human-review`, or `symphony:done`. Priority comes only from exactly one of
+  `priority:p0`, `priority:p1`, or `priority:p2`. Missing, conflicting, malformed, or case-variant
+  labels fail closed.
+- Auth: `token` is required and may be a `$VAR_NAME` host-side reference. The example uses
+  `$SYMPHONY_GITHUB_TOKEN`. Token values are removed from the Codex child environment and are not
+  included in prompts, logs, or tool results. Use a fine-grained PAT limited to the selected
+  repository only, with Issues read/write, Pull requests read-only, Metadata read-only, and every
+  other permission disabled. Do not use a classic PAT or grant Project permissions.
+- Eligibility: only open issues carrying the exact `symphony:ready` label can dispatch. Pull
+  requests returned by issue APIs are skipped; open blockers make an issue non-dispatchable.
+  `issue.id` is the immutable issue node ID. `native_ref` contains only repository identity, issue
+  number, and issue node ID—never Project IDs, item IDs, field IDs, or option IDs.
+- Reliability: repository issue reads use bounded pagination (`max_pages`, default 20, maximum 100)
+  and explicit permission, rate-limit, malformed-payload, and dependency-pagination failures.
+- Mutations: Codex receives only `github_workpad`, `github_apply_workflow_label`, and
+  `github_attach_draft_pr`. They can upsert one marker-owned workpad comment, apply one configured
+  allowlisted label, and verify/attach an open Draft PR URL whose base repository and branch exactly
+  match the configured scope. Before every mutation, Symphony re-fetches and checks the exact
+  repository identity, issue number/node ID, open state, workflow eligibility, blockers, and
+  session-bound identity. Tool results contain only minimal IDs/status, not raw
+  provider bodies. There is no raw
+  REST/GraphQL tool and no Contents, refs, branch-write, delete, repository administration, workflow,
+  ruleset, merge, or Project capability.
+
+Git/SSH feature-branch pushes are a separate credential domain from the API PAT. Server-side rules
+must reject pushes to `main` and `staging`; a credential that can bypass those rules is a hard NO-GO.
 
 ### Jira Cloud adapter
 
@@ -346,14 +368,63 @@ The live test creates a temporary Linear project and issue, writes a temporary `
 a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
-Run the opt-in GitHub Issues live test with a disposable/scratch repository:
+The opt-in, fail-closed GitHub test uses an already-provisioned dedicated issue and open Draft PR.
+With the exact token under test, it proves that the private issue body and Draft PR metadata are
+readable; issue-comment create/update and allowlisted label mutations succeed; and read-only probes
+of Contents, git refs, branch protection/rulesets, and Actions/workflows are denied. It
+never creates, closes, deletes, merges, changes a branch, changes administration settings, or
+mutates a workflow:
 
 ```bash
 cd elixir
-export SYMPHONY_LIVE_GITHUB_REPO=owner/scratch-repo
-export GITHUB_TOKEN=...
-SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mix test test/symphony_elixir/github_live_e2e_test.exs
+export SYMPHONY_GITHUB_TOKEN=...
+export SYMPHONY_LIVE_GITHUB_REPO=owner/repo
+export SYMPHONY_LIVE_GITHUB_REPOSITORY_ID=R_...
+# Independent, fail-closed confirmation of the dedicated pilot target:
+export SYMPHONY_LIVE_GITHUB_EXPECTED_REPO=owner/repo
+export SYMPHONY_LIVE_GITHUB_EXPECTED_REPOSITORY_ID=R_...
+export SYMPHONY_LIVE_GITHUB_ISSUE_NUMBER=123
+export SYMPHONY_LIVE_GITHUB_ISSUE_NODE_ID=I_...
+export SYMPHONY_LIVE_GITHUB_BASE_BRANCH=staging
+export SYMPHONY_LIVE_GITHUB_DRAFT_PR_URL=https://github.com/owner/repo/pull/456
+export SYMPHONY_LIVE_GITHUB_ACTOR_ID=U_...
+SYMPHONY_RUN_GITHUB_PILOT_LIVE_E2E=1 \
+  mix test test/symphony_elixir/github_pilot_live_e2e_test.exs
 ```
+
+The test compares the configured repository and repository node ID with separately supplied expected
+values before its first GitHub request. It also rejects the exact repository name
+`Renewable-Fuels` (case-insensitively); that name check does not reject the distinct
+`Renewable-Fuels-Trading-Intelligence` name. The explicit expected values are the authoritative
+confirmation of the repository/issue pilot target actually in use.
+
+`GET /repos/{owner}/{repo}.permissions` reports the authenticated user's repository role. In a
+user-owned repository it can report `admin=true` and `push=true` for the owner even when the exact
+fine-grained PAT has none of the corresponding grants, so it is not token-permission evidence. The
+`X-Accepted-GitHub-Permissions` response header similarly describes permissions accepted by an
+endpoint, not permissions granted to the token; the test records it only as denial diagnostics.
+
+GitHub's [merge endpoint documentation](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+says that merging requires Contents write, but GitHub does not document a safe, read-only request
+that reports whether a fine-grained PAT can merge. The live test therefore does not claim direct
+runtime proof of absent merge authority and never attempts a merge. The pilot contract instead
+requires a PAT configured with Issues write and Pull requests read only, with no Contents,
+Administration, Actions, or Workflows grant. The pilot PAT was manually configured without an
+explicit Projects permission. GitHub may nevertheless expose readable Project metadata through
+GraphQL; generic read visibility is not evidence of a Projects permission or mutation authority,
+and Symphony never uses that visibility. Absence of Project mutation authority cannot be safely
+runtime-tested without attempting a mutation, so the live test makes no such probe or claim. Denied
+Contents and git-ref reads are runtime supporting evidence for that configured contract. GitHub's
+[permission-header documentation](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#resource-not-found)
+defines `X-Accepted-GitHub-Permissions` in terms of endpoint requirements.
+
+Before any live pilot, independently inspect the fine-grained PAT configuration and verify that the
+execution credential has that contract and cannot merge PRs, delete content, change repository
+settings/rulesets/branch protection, or write `main`; that `main` and `staging` reject direct pushes;
+and that only feature branches can be pushed. The adapter cannot turn a broadly privileged SSH key
+into a branch-scoped credential. Treat any missing server-side control as a hard NO-GO even though
+the in-process GitHub tools themselves have no merge, delete, administration, Project-mutation, or
+branch-write route.
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
 create, comment on, transition, and delete issues:
