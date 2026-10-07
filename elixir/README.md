@@ -137,8 +137,17 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_cumulative_tokens: 200000
 codex:
   command: codex app-server
+  approval_policy:
+    granular:
+      sandbox_approval: true
+      rules: true
+      mcp_elicitations: true
+      request_permissions: false
+      skill_approval: false
+  approvals_reviewer: auto_review
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -156,12 +165,17 @@ Notes:
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
 - Safer Codex defaults are used when policy fields are omitted:
-  - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
+  - `codex.approval_policy` defaults to the structured `granular` policy shown above.
+  - `codex.approvals_reviewer` defaults to `auto_review`, which routes enabled granular approval
+    classes to Codex's internal risk reviewer. If an approval request still reaches Symphony,
+    Symphony stops the run; it never sends an approval decision.
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
-- Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
+- Codex 0.159.2 accepts scalar `untrusted`, `on-request`, and `never`, or the exact structured
+  `granular` form shown above. The three first granular keys are required booleans; the last two are
+  optional booleans. Symphony rejects malformed forms while loading `WORKFLOW.md`.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
@@ -170,7 +184,12 @@ Notes:
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+  invocation when a turn completes normally but the issue is still in an active state. Reaching the
+  limit stops and blocks the run instead of scheduling another worker. Default: `20`.
+- `agent.max_cumulative_tokens` is a fail-closed per-run ceiling over the app-server's cumulative
+  `totalTokens`. Symphony stops and blocks the run as soon as the reported total reaches the ceiling.
+  Default: `200000`. Input, cached input, output, and total counters are shown separately when
+  available; these protocol counters are observability data and are not claimed to equal billing.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

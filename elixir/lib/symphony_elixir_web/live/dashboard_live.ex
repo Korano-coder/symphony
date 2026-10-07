@@ -101,7 +101,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
+              In <%= format_int(@payload.codex_totals.input_tokens) %> (cached <%= format_int(Map.get(@payload.codex_totals, :cached_input_tokens, 0)) %>) / Out <%= format_int(@payload.codex_totals.output_tokens) %>
             </p>
           </article>
 
@@ -202,7 +202,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> (cached <%= format_int(Map.get(entry.tokens, :cached_input_tokens, 0)) %>) / Out <%= format_int(entry.tokens.output_tokens) %></span>
                       </div>
                     </td>
                   </tr>

@@ -151,6 +151,7 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
+      field(:max_cumulative_tokens, :integer, default: 200_000)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
@@ -160,11 +161,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_cumulative_tokens,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
+      |> validate_number(:max_cumulative_tokens, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
@@ -182,13 +190,15 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:approval_policy, StringOrMap,
         default: %{
-          "reject" => %{
+          "granular" => %{
             "sandbox_approval" => true,
             "rules" => true,
             "mcp_elicitations" => true
           }
         }
       )
+
+      field(:approvals_reviewer, :string, default: "auto_review")
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
@@ -205,6 +215,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :command,
           :approval_policy,
+          :approvals_reviewer,
           :thread_sandbox,
           :turn_sandbox_policy,
           :turn_timeout_ms,
@@ -214,6 +225,8 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_inclusion(:approvals_reviewer, ["user", "auto_review", "guardian_subagent"])
+      |> validate_approval_policy()
       |> validate_change(:command, fn :command, command ->
         if command != "" and String.trim(command) == "" do
           [command: "can't be blank"]
@@ -224,6 +237,38 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    defp validate_approval_policy(changeset) do
+      validate_change(changeset, :approval_policy, fn :approval_policy, policy ->
+        case policy do
+          scalar when scalar in ["untrusted", "on-request", "never"] ->
+            []
+
+          %{"granular" => granular} = wrapper when map_size(wrapper) == 1 and is_map(granular) ->
+            validate_granular_policy(granular)
+
+          _ ->
+            [
+              approval_policy: "must be one of untrusted, on-request, never, or a granular map with boolean sandbox_approval, rules, and mcp_elicitations"
+            ]
+        end
+      end)
+    end
+
+    defp validate_granular_policy(granular) do
+      required = ["sandbox_approval", "rules", "mcp_elicitations"]
+      allowed = required ++ ["request_permissions", "skill_approval"]
+      missing = Enum.reject(required, &Map.has_key?(granular, &1))
+      unknown = Map.keys(granular) -- allowed
+      non_boolean = Enum.filter(granular, fn {_key, value} -> not is_boolean(value) end) |> Enum.map(&elem(&1, 0))
+
+      cond do
+        missing != [] -> [approval_policy: "granular is missing required boolean keys: #{Enum.join(missing, ", ")}"]
+        unknown != [] -> [approval_policy: "granular contains unsupported keys: #{Enum.join(unknown, ", ")}"]
+        non_boolean != [] -> [approval_policy: "granular values must be booleans: #{Enum.join(non_boolean, ", ")}"]
+        true -> []
+      end
     end
   end
 

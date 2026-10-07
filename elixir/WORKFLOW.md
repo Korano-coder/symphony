@@ -30,9 +30,17 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_cumulative_tokens: 200000
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
-  approval_policy: never
+  approval_policy:
+    granular:
+      sandbox_approval: true
+      rules: true
+      mcp_elicitations: true
+      request_permissions: false
+      skill_approval: false
+  approvals_reviewer: auto_review
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite

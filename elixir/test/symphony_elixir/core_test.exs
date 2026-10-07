@@ -18,6 +18,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_cumulative_tokens == 200_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -77,7 +78,8 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: "definitely-not-valid")
-    assert :ok = Config.validate!()
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.approval_policy"
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_thread_sandbox: "unsafe-ish")
     assert :ok = Config.validate!()
@@ -1879,6 +1881,7 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
@@ -1969,7 +1972,7 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
         codex_command: "#{codex_binary} app-server",
-        max_turns: 2
+        max_turns: 1
       )
 
       state_fetcher = fn [_issue_id] ->
@@ -1996,11 +1999,13 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert_raise RuntimeError, ~r/max_turns_reached, 1/, fn ->
+        AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      end
 
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
-      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -2099,7 +2104,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    expected_approval_policy = %{
-                     "reject" => %{
+                     "granular" => %{
                        "sandbox_approval" => true,
                        "rules" => true,
                        "mcp_elicitations" => true
@@ -2132,7 +2137,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    expected_approval_policy = %{
-                     "reject" => %{
+                     "granular" => %{
                        "sandbox_approval" => true,
                        "rules" => true,
                        "mcp_elicitations" => true
