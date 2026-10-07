@@ -323,8 +323,12 @@ defmodule SymphonyElixir.GitHub.Client do
       else: :ok
   end
 
+  defp project_configuration?(%_{} = value), do: value |> Map.from_struct() |> project_configuration?()
+
   defp project_configuration?(value) when is_map(value) do
-    Enum.any?(value, fn {key, nested} -> project_key?(key) or project_configuration?(nested) end)
+    Enum.any?(value, fn {key, nested} ->
+      (project_key?(key) and not is_nil(nested)) or project_configuration?(nested)
+    end)
   end
 
   defp project_configuration?(value) when is_list(value), do: Enum.any?(value, &project_configuration?/1)
