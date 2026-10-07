@@ -190,6 +190,23 @@ Notes:
   `totalTokens`. Symphony stops and blocks the run as soon as the reported total reaches the ceiling.
   Default: `200000`. Input, cached input, output, and total counters are shown separately when
   available; these protocol counters are observability data and are not claimed to equal billing.
+  Enforcement is report-granular, not a mid-generation token interrupt: the app-server can report
+  usage only after a turn has consumed tokens (and some versions report the first cumulative total
+  at turn completion). A single turn can therefore exceed the configured ceiling by all tokens
+  consumed after the last usage report. Symphony cannot state a smaller numeric maximum; the outer
+  bound is the Codex/model turn limit. The exact reported total and configured ceiling remain visible
+  in the terminal stop reason. Before starting any later turn, the prior turn's usage has already
+  passed through this guard, so no additional pre-turn estimate is invented.
+- Resource-limit stops (`cumulative_token_limit_reached` and `max_turns_reached`) and explicit
+  operator/approval/policy stops are terminal for that dispatch. They remain claimed and visible as
+  blocked while the issue stays active, are never placed in retry backoff, and are not redispatched
+  merely because a tracker label remains active. A JSON marker under
+  `<workspace.root>/.symphony/terminal_runs/` restores that terminal claim after an app restart.
+  The marker is scoped to the tracker item's dispatch version and is removed after an observed
+  terminal, non-active, or unroutable transition, allowing an explicit reopen/relabel to create a
+  new dispatch. Tracker labels are not changed implicitly.
+- Timeouts, port exits, workspace/startup failures, tracker refresh failures, and other unclassified
+  infrastructure errors remain transient and use bounded retry backoff.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

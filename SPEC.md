@@ -713,7 +713,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (abnormal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - Schedule exponential-backoff retry.
+  - If the structured exit reason is a resource-limit or explicit policy/operator stop, retain the
+    issue as claimed and blocked with its exact terminal reason; do not schedule a retry.
+  - Otherwise schedule exponential-backoff retry for the transient failure.
 
 - `Codex Update Event`
   - Update live session fields, token counters, and rate limits.
@@ -813,6 +815,23 @@ Retry handling behavior:
 4. If found and still active and routable:
    - Dispatch if slots are available.
    - Otherwise requeue with error `no available orchestrator slots`.
+
+Terminal dispatch stops are not retry entries. `cumulative_token_limit_reached`,
+`max_turns_reached`, approval-policy rejection, approval/input-required, and protocol-start policy
+failures remain claimed in blocked state while their tracker issue remains active. Polling and
+reconciliation MUST NOT redispatch them solely because the active tracker state or label is
+unchanged. The implementation persists a JSON terminal-run marker beneath the local workspace root
+and recovers it before candidate selection after restart. This state transition does not implicitly
+mutate tracker labels. Markers are scoped to the tracker item's dispatch version and are removed
+after an observed terminal, non-active, or unroutable transition so a later explicit reopen or
+reroute can create a new dispatch. Unclassified failures
+such as timeouts, port exits, and infrastructure startup failures remain transient.
+
+The cumulative-token ceiling is enforced when the Codex app-server reports cumulative usage. The
+protocol does not provide Symphony a mid-generation hard-stop primitive. If usage is first reported
+at turn completion, the possible overshoot is the entire consumption after the previous report
+(for the first turn, the turn's full consumption above the ceiling), bounded externally by the
+Codex/model turn limit rather than by `agent.max_cumulative_tokens`.
 5. If found but no longer active or routable, release claim without dispatch.
 
 Note:

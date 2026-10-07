@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, RunFailure, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -31,7 +31,12 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+        if RunFailure.terminal?(reason) do
+          exit({:shutdown, {:terminal_run, reason}})
+        else
+          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        end
     end
   end
 
@@ -160,7 +165,13 @@ defmodule SymphonyElixir.AgentRunner do
             :ok
 
           {:error, reason} ->
-            {:error, reason}
+            handle_issue_refresh_error(
+              issue,
+              codex_update_recipient,
+              reason,
+              turn_number,
+              max_turns
+            )
         end
 
       {:error, {:response_error, _details} = reason} ->
@@ -172,6 +183,19 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp handle_issue_refresh_error(issue, recipient, reason, turn_number, max_turns)
+       when turn_number >= max_turns do
+    stop_reason = {:max_turns_reached, max_turns, reason}
+
+    Logger.warning("Reached agent.max_turns for #{issue_context(issue)} and final issue-state refresh failed; stopping run reason=#{inspect(reason)}")
+
+    send_run_stopped(recipient, issue, stop_reason)
+    {:error, stop_reason}
+  end
+
+  defp handle_issue_refresh_error(_issue, _recipient, reason, _turn_number, _max_turns),
+    do: {:error, reason}
 
   defp send_run_stopped(recipient, issue, reason) do
     send_codex_update(recipient, issue, %{

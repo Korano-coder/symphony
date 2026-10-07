@@ -146,9 +146,8 @@ defmodule SymphonyElixir.SafetyFusesTest do
       hook_after_create: "true"
     )
 
-    assert_raise RuntimeError, ~r/protocol_start_failure/, fn ->
-      AgentRunner.run(issue("turn-start-error"), self())
-    end
+    assert {:shutdown, {:terminal_run, {:protocol_start_failure, {:response_error, _}}}} =
+             catch_exit(AgentRunner.run(issue("turn-start-error"), self()))
 
     assert_receive {:codex_worker_update, "issue-turn-start-error",
                     %{

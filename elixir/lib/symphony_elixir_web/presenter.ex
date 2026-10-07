@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.{Config, Orchestrator, RunFailure, StatusDashboard, Workspace}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -97,6 +97,10 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
+
+  defp issue_status(nil, nil, %{terminal_reason: terminal_reason}) when not is_nil(terminal_reason),
+    do: "terminal"
+
   defp issue_status(nil, nil, _blocked), do: "blocked"
 
   defp running_entry_payload(entry) do
@@ -136,7 +140,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp blocked_entry_payload(entry) do
-    %{
+    payload = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
@@ -150,6 +154,21 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
+
+    case Map.get(entry, :terminal_reason) do
+      nil ->
+        payload
+
+      terminal_reason ->
+        Map.merge(payload, %{
+          status: "terminal",
+          terminal_reason: RunFailure.to_payload(terminal_reason),
+          codex_input_tokens: Map.get(entry, :codex_input_tokens, 0),
+          codex_cached_input_tokens: Map.get(entry, :codex_cached_input_tokens, 0),
+          codex_output_tokens: Map.get(entry, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(entry, :codex_total_tokens, 0)
+        })
+    end
   end
 
   defp running_issue_payload(running) do
@@ -183,7 +202,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp blocked_issue_payload(blocked) do
-    %{
+    payload = %{
       worker_host: Map.get(blocked, :worker_host),
       workspace_path: Map.get(blocked, :workspace_path),
       session_id: blocked.session_id,
@@ -194,6 +213,20 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(blocked.last_codex_message),
       last_event_at: iso8601(blocked.last_codex_timestamp)
     }
+
+    case Map.get(blocked, :terminal_reason) do
+      nil ->
+        payload
+
+      terminal_reason ->
+        Map.merge(payload, %{
+          terminal_reason: RunFailure.to_payload(terminal_reason),
+          codex_input_tokens: Map.get(blocked, :codex_input_tokens, 0),
+          codex_cached_input_tokens: Map.get(blocked, :codex_cached_input_tokens, 0),
+          codex_output_tokens: Map.get(blocked, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(blocked, :codex_total_tokens, 0)
+        })
+    end
   end
 
   defp workspace_path(issue_identifier, running, retry, blocked) do

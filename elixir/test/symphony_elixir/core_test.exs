@@ -1999,13 +1999,21 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert_raise RuntimeError, ~r/max_turns_reached, 1/, fn ->
-        AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-      end
+      assert catch_exit(AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)) ==
+               {:shutdown, {:terminal_run, {:max_turns_reached, 1}}}
 
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+
+      File.write!(trace_file, "")
+      refresh_error = {:issue_state_refresh_failed, :tracker_unavailable}
+
+      assert catch_exit(AgentRunner.run(issue, nil, issue_state_fetcher: fn [_issue_id] -> {:error, :tracker_unavailable} end)) == {:shutdown, {:terminal_run, {:max_turns_reached, 1, refresh_error}}}
+
+      failed_refresh_trace = File.read!(trace_file)
+      assert length(String.split(failed_refresh_trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, failed_refresh_trace)) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
