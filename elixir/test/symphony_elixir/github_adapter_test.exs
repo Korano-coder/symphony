@@ -39,6 +39,41 @@ defmodule SymphonyElixir.GitHubAdapterTest do
              Adapter.validate_config(Map.delete(settings(), :required_labels))
   end
 
+  test "workflow store accepts a parsed GitHub tracker with the legacy nil project slug" do
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      provider:
+        repo: "owner/repo"
+        repository_id: "R_repo"
+        base_branch: "main"
+        token: "test-token"
+        workflow_labels:
+          - "symphony:ready"
+          - "symphony:in-progress"
+          - "symphony:human-review"
+          - "symphony:done"
+        priority_labels:
+          - "priority:p0"
+          - "priority:p1"
+          - "priority:p2"
+        actor_id: "U_actor"
+      required_labels: ["symphony:ready"]
+      active_states: ["symphony:ready", "symphony:in-progress"]
+      terminal_states: ["symphony:human-review", "symphony:done"]
+    workspace:
+      root: "./workspaces"
+    ---
+    Work only on the configured GitHub repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, %{tracker: %Config.Schema.Tracker{kind: "github", project_slug: nil}}} = WorkflowStore.settings()
+  end
+
   test "adapter delegates reads, tools, and secret names" do
     previous = Application.get_env(:symphony_elixir, :github_client_module)
     Application.put_env(:symphony_elixir, :github_client_module, FakeClient)
