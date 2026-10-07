@@ -1017,7 +1017,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
-             "reject" => %{
+             "granular" => %{
                "sandbox_approval" => true,
                "rules" => true,
                "mcp_elicitations" => true
@@ -1131,8 +1131,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, _message}} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: "")
-    assert :ok = Config.validate!()
-    assert Config.settings!().codex.approval_policy == ""
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.approval_policy"
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_thread_sandbox: "")
     assert :ok = Config.validate!()
@@ -1151,8 +1151,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       }
     )
 
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.approval_policy"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_approval_policy: "on-request",
+      codex_thread_sandbox: "future-sandbox",
+      codex_turn_sandbox_policy: %{
+        type: "futureSandbox",
+        nested: %{flag: true}
+      }
+    )
+
     config = Config.settings!()
-    assert config.codex.approval_policy == "future-policy"
     assert config.codex.thread_sandbox == "future-sandbox"
 
     assert :ok = Config.validate!()
@@ -1395,14 +1406,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{kind: "linear", api_key: "$#{empty_secret_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
-               codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
+               codex: %{
+                 approval_policy: %{
+                   granular: %{sandbox_approval: true, rules: true, mcp_elicitations: true}
+                 }
+               }
              })
 
     assert settings.tracker.api_key == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
 
     assert settings.codex.approval_policy == %{
-             "reject" => %{"sandbox_approval" => true}
+             "granular" => %{
+               "sandbox_approval" => true,
+               "rules" => true,
+               "mcp_elicitations" => true
+             }
            }
 
     assert {:ok, settings} =

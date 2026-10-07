@@ -25,6 +25,17 @@ polling:
   interval_ms: 30000
 agent:
   max_concurrent_agents: 1
+  max_turns: 20
+  max_cumulative_tokens: 200000
+codex:
+  approval_policy:
+    granular:
+      sandbox_approval: true
+      rules: true
+      mcp_elicitations: true
+      request_permissions: false
+      skill_approval: false
+  approvals_reviewer: auto_review
 workspace:
   root: "~/symphony_workspaces"
 hooks:

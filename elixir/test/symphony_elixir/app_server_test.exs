@@ -479,7 +479,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves command execution approval requests when approval policy is never" do
+  test "app server fails closed when a command approval request arrives under never" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -554,7 +554,8 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle approval request", issue)
+      assert {:error, {:approval_required, _payload}} =
+               AppServer.run(workspace, "Handle approval request", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -599,14 +600,14 @@ defmodule SymphonyElixir.AppServerTest do
                end
              end)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+                 payload["id"] == 99
                else
                  false
                end
@@ -616,7 +617,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves MCP tool approval prompts when approval policy is never" do
+  test "app server fails closed for MCP tool approval prompts under never" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -691,21 +692,20 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle tool approval prompt", issue)
+      assert {:error, {:turn_input_required, _payload}} =
+               AppServer.run(workspace, "Handle tool approval prompt", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 110 and
-                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
-                     ["Approve this Session"]
+                 payload["id"] == 110
                else
                  false
                end

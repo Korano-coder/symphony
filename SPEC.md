@@ -452,6 +452,9 @@ Fields:
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
   - Invalid values fail configuration validation.
+- `max_cumulative_tokens` (positive integer)
+  - Default: `200000`.
+  - Stops and blocks a run when Codex reports an absolute cumulative token total at or above the limit.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -477,6 +480,8 @@ fields locally if they want stricter startup checks.
   - The runtime launches this command via `bash -lc` in the workspace directory.
   - The launched process MUST speak a compatible app-server protocol over stdio.
 - `approval_policy` (Codex `AskForApproval` value)
+  - Default: implementation-defined.
+- `approvals_reviewer` (Codex `ApprovalsReviewer` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
   - Default: implementation-defined.

@@ -1170,6 +1170,55 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = state.blocked[issue_id]
   end
 
+  test "orchestrator exposes the token-fuse stop reason and schedules no retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-token-fuse"
+    orchestrator_name = Module.concat(__MODULE__, :TokenFuseBlockOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+    reason = {:cumulative_token_limit_reached, 200_000, 200_000}
+    issue = %Issue{id: issue_id, identifier: "MT-FUSE", state: "In Progress", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-FUSE",
+      issue: issue,
+      session_id: "thread-fuse-turn-fuse",
+      last_codex_message: %{
+        event: :run_stopped,
+        message: %{stop_reason: reason},
+        timestamp: started_at
+      },
+      last_codex_timestamp: started_at,
+      last_codex_event: :run_stopped,
+      started_at: started_at
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), {:shutdown, reason}})
+    Process.sleep(50)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert snapshot.retrying == []
+
+    assert [%{identifier: "MT-FUSE", error: error}] = snapshot.blocked
+    assert error =~ "cumulative_token_limit_reached"
+    assert error =~ "200000"
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->

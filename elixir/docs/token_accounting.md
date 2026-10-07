@@ -162,6 +162,14 @@ Rule:
 - never classify a `usage` map by name alone
 - classify it by event type and payload path
 
+Symphony's `agent.max_cumulative_tokens` fuse uses only the app-server's absolute cumulative
+`tokenUsage.total.totalTokens` (or the equivalent canonical core total), never a context-window
+value or an inferred sum. The default ceiling is 200,000 tokens per agent run. Reaching it is a
+terminal, operator-visible blocked state: Symphony closes the app-server session and schedules no
+continuation or retry. The dashboard distinguishes input, cached input, output, and total where the
+protocol exposes them. These are protocol usage counters; Symphony does not label them as billable
+tokens or cost.
+
 ## What The Metrics Mean
 
 ### Absolute totals
