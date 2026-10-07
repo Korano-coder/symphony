@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RunFailure, StatusDashboard, TerminalRunStore, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :dispatch_halted,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -65,6 +66,7 @@ defmodule SymphonyElixir.Orchestrator do
           poll_check_in_progress: false,
           tick_timer_ref: nil,
           tick_token: nil,
+          dispatch_halted: Application.get_env(:symphony_elixir, :terminal_dispatch_halted, false),
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -225,12 +227,66 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    case RunFailure.terminal_reason(reason) do
+      nil ->
+        if input_required_blocker?(running_entry) do
+          block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+        else
+          retry_agent_down(state, issue_id, running_entry, session_id, reason)
+        end
+
+      terminal_reason ->
+        stop_terminal_agent_down(
+          state,
+          issue_id,
+          running_entry,
+          session_id,
+          terminal_reason
+        )
     end
   end
+
+  defp stop_terminal_agent_down(state, issue_id, running_entry, session_id, terminal_reason) do
+    error = "terminal codex run stopped: #{inspect(terminal_reason)}"
+
+    Logger.warning(
+      "Agent task stopped permanently for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} terminal_reason=#{inspect(terminal_reason)}; retry_scheduled=false"
+    )
+
+    state = block_issue_from_entry(state, issue_id, running_entry, error, terminal_reason)
+
+    case persist_terminal_run(running_entry, terminal_reason) do
+      :ok ->
+        state
+
+      {:error, _reason} ->
+        Application.put_env(:symphony_elixir, :terminal_dispatch_halted, true, persistent: true)
+        %{state | dispatch_halted: true}
+    end
+  end
+
+  defp persist_terminal_run(%{issue: %Issue{} = issue} = running_entry, terminal_reason) do
+    payload = %{
+      "terminal_reason" => RunFailure.to_payload(terminal_reason),
+      "codex_input_tokens" => Map.get(running_entry, :codex_input_tokens, 0),
+      "codex_cached_input_tokens" => Map.get(running_entry, :codex_cached_input_tokens, 0),
+      "codex_output_tokens" => Map.get(running_entry, :codex_output_tokens, 0),
+      "codex_total_tokens" => terminal_total_tokens(terminal_reason, running_entry),
+      "dispatch_version" => issue_dispatch_version(issue),
+      "stopped_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    case TerminalRunStore.put(issue, payload) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.error("Failed to persist terminal run for #{issue_context(issue)}: #{inspect(reason)}; halting dispatch")
+        error
+    end
+  end
+
+  defp persist_terminal_run(_running_entry, _terminal_reason), do: :ok
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -255,6 +311,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    if state.dispatch_halted do
+      Logger.error("Dispatch remains halted because a terminal run could not be persisted")
+      state
+    else
+      do_maybe_dispatch(state)
+    end
+  end
+
+  defp do_maybe_dispatch(%State{} = state) do
     state =
       state
       |> reconcile_running_issues()
@@ -263,7 +328,9 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      state
+      |> recover_terminal_runs(issues)
+      |> then(&choose_issues(issues, &1))
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -459,22 +526,33 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
-        release_issue_claim(state, issue.id)
+        release_terminal_issue_claim(state, issue)
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
-        release_issue_claim(state, issue.id)
+        release_terminal_issue_claim(state, issue)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_blocked_issue_state(state, issue)
 
       true ->
         Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        release_issue_claim(state, issue.id)
+        release_terminal_issue_claim(state, issue)
     end
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp release_terminal_issue_claim(state, issue) do
+    case TerminalRunStore.delete(issue) do
+      :ok ->
+        release_issue_claim(state, issue.id)
+
+      {:error, reason} ->
+        Logger.error("Failed deleting terminal dispatch marker for #{issue_context(issue)}: #{inspect(reason)}; keeping issue blocked")
+        state
+    end
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -776,7 +854,7 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, terminal_reason \\ nil) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -785,6 +863,11 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      terminal_reason: terminal_reason || codex_message_stop_reason(Map.get(running_entry, :last_codex_message)),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_cached_input_tokens: Map.get(running_entry, :codex_cached_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: terminal_total_tokens(terminal_reason, running_entry),
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
@@ -799,6 +882,83 @@ defmodule SymphonyElixir.Orchestrator do
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
   end
+
+  defp recover_terminal_runs(%State{} = state, issues) do
+    Enum.reduce(issues, state, fn issue, state_acc ->
+      if Map.has_key?(state_acc.blocked, issue.id) do
+        state_acc
+      else
+        recover_terminal_run(state_acc, issue)
+      end
+    end)
+  end
+
+  defp recover_terminal_run(state, %Issue{} = issue) do
+    case TerminalRunStore.get(issue) do
+      {:ok, marker} ->
+        recover_matching_terminal_run(state, issue, marker)
+
+      :missing ->
+        state
+
+      {:error, reason} ->
+        Logger.error("Failed reading terminal dispatch marker for #{issue_context(issue)}: #{inspect(reason)}; failing closed")
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
+    end
+  end
+
+  defp recover_matching_terminal_run(state, issue, marker) do
+    if Map.get(marker, "dispatch_version") == issue_dispatch_version(issue) do
+      terminal_reason = Map.get(marker, "terminal_reason", %{"kind" => "terminal_run"})
+
+      Logger.warning("Recovered terminal dispatch marker for #{issue_context(issue)} terminal_reason=#{inspect(terminal_reason)}; retry_scheduled=false")
+
+      blocked_entry = %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "n/a",
+        error: "terminal codex run stopped: #{inspect(terminal_reason)}",
+        terminal_reason: terminal_reason,
+        codex_input_tokens: Map.get(marker, "codex_input_tokens", 0),
+        codex_cached_input_tokens: Map.get(marker, "codex_cached_input_tokens", 0),
+        codex_output_tokens: Map.get(marker, "codex_output_tokens", 0),
+        codex_total_tokens: Map.get(marker, "codex_total_tokens", 0),
+        blocked_at: parse_marker_datetime(Map.get(marker, "stopped_at"))
+      }
+
+      %{
+        state
+        | blocked: Map.put(state.blocked, issue.id, blocked_entry),
+          claimed: MapSet.put(state.claimed, issue.id)
+      }
+    else
+      case TerminalRunStore.delete(issue) do
+        :ok ->
+          state
+
+        {:error, reason} ->
+          Logger.error("Failed replacing stale terminal dispatch marker for #{issue_context(issue)}: #{inspect(reason)}; failing closed")
+          %{state | claimed: MapSet.put(state.claimed, issue.id)}
+      end
+    end
+  end
+
+  defp issue_dispatch_version(%Issue{} = issue) do
+    {issue.state, Enum.sort(issue.labels), issue.assignee_id, issue.dispatchable}
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp parse_marker_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _ -> DateTime.utc_now()
+    end
+  end
+
+  defp parse_marker_datetime(_value), do: DateTime.utc_now()
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -1487,6 +1647,11 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
           error: Map.get(metadata, :error),
+          terminal_reason: Map.get(metadata, :terminal_reason),
+          codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_cached_input_tokens: Map.get(metadata, :codex_cached_input_tokens, 0),
+          codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
@@ -1529,6 +1694,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
+
+  defp terminal_total_tokens({:cumulative_token_limit_reached, total, _limit}, _running_entry),
+    do: total
+
+  defp terminal_total_tokens(_terminal_reason, running_entry),
+    do: Map.get(running_entry, :codex_total_tokens, 0)
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)

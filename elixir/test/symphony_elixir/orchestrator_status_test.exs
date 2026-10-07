@@ -1,6 +1,21 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  test "persistent terminal-store failure halts dispatch after orchestrator restart" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :terminal_dispatch_halted, true, persistent: true)
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :terminal_dispatch_halted, persistent: true) end)
+
+    name = Module.concat(__MODULE__, :PersistedHaltOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    assert :sys.get_state(pid).dispatch_halted
+    send(pid, :run_poll_cycle)
+    Process.sleep(20)
+    assert :sys.get_state(pid).running == %{}
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -1181,7 +1196,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     ref = make_ref()
     started_at = DateTime.utc_now()
     reason = {:cumulative_token_limit_reached, 200_000, 200_000}
-    issue = %Issue{id: issue_id, identifier: "MT-FUSE", state: "In Progress", dispatchable: true}
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-FUSE",
+      state: "In Progress",
+      dispatchable: true,
+      updated_at: ~U[2026-10-07 10:00:00Z]
+    }
+
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
     running_entry = %{
@@ -1217,6 +1240,156 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert [%{identifier: "MT-FUSE", error: error}] = snapshot.blocked
     assert error =~ "cumulative_token_limit_reached"
     assert error =~ "200000"
+
+    assert [%{terminal_reason: ^reason, codex_total_tokens: 200_000}] = snapshot.blocked
+
+    assert {:ok,
+            %{
+              status: "terminal",
+              blocked: %{
+                terminal_reason: %{
+                  kind: "cumulative_token_limit_reached",
+                  total_tokens: 200_000,
+                  token_limit: 200_000
+                },
+                codex_total_tokens: 200_000
+              }
+            } = api_payload} =
+             SymphonyElixirWeb.Presenter.issue_payload("MT-FUSE", orchestrator_name, 1_000)
+
+    assert {:ok, _json} = Jason.encode(api_payload)
+
+    GenServer.stop(pid)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %{issue | updated_at: ~U[2026-10-07 11:00:00Z]}
+    ])
+
+    restart_name = Module.concat(__MODULE__, :TokenFuseRestartOrchestrator)
+    {:ok, restarted_pid} = Orchestrator.start_link(name: restart_name)
+    on_exit(fn -> if Process.alive?(restarted_pid), do: Process.exit(restarted_pid, :normal) end)
+    send(restarted_pid, :run_poll_cycle)
+    Process.sleep(50)
+
+    restarted_snapshot = Orchestrator.snapshot(restart_name, 1_000)
+    assert restarted_snapshot.running == []
+    assert restarted_snapshot.retrying == []
+
+    assert [%{terminal_reason: %{"kind" => "cumulative_token_limit_reached"}}] =
+             restarted_snapshot.blocked
+
+    terminal_issue = %{issue | state: "Done", dispatchable: false}
+    restarted_state = :sys.get_state(restarted_pid)
+
+    released_state =
+      Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], restarted_state)
+
+    refute Map.has_key?(released_state.blocked, issue_id)
+    refute MapSet.member?(released_state.claimed, issue_id)
+    assert :missing = SymphonyElixir.TerminalRunStore.get(issue)
+  end
+
+  test "terminal max-turn and approval-policy exits never enter backoff" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    for {suffix, reason} <- [
+          {:max_turns, {:max_turns_reached, 1}},
+          {:approval, {:approval_policy_rejection, "rejected by configured policy"}}
+        ] do
+      issue_id = "issue-terminal-#{suffix}"
+      orchestrator_name = Module.concat(__MODULE__, "Terminal#{suffix}Orchestrator")
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      ref = make_ref()
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-#{suffix}",
+        title: "Terminal stop",
+        state: "In Progress",
+        dispatchable: true
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        running_entry = %{
+          pid: self(),
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          session_id: "thread-terminal",
+          started_at: DateTime.utc_now()
+        }
+
+        %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), {:shutdown, {:terminal_run, reason}}})
+      Process.sleep(20)
+
+      snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+      assert snapshot.retrying == []
+      assert [%{terminal_reason: ^reason}] = snapshot.blocked
+
+      # An active tracker label/state remains present, but reconciliation keeps the
+      # terminal dispatch claimed and therefore cannot start a second worker.
+      send(pid, :run_poll_cycle)
+      Process.sleep(20)
+      state = :sys.get_state(pid)
+      assert Map.has_key?(state.blocked, issue_id)
+      assert MapSet.member?(state.claimed, issue_id)
+      refute Map.has_key?(state.running, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+
+      Process.exit(pid, :normal)
+    end
+  end
+
+  test "transient worker exits retain bounded retry backoff" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_backoff_ms: 12_000
+    )
+
+    issue_id = "issue-transient-retry"
+    orchestrator_name = Module.concat(__MODULE__, :TransientRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+    ref = make_ref()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TRANSIENT",
+      title: "Transient failure",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-transient",
+        started_at: DateTime.utc_now(),
+        retry_attempt: 8
+      }
+
+      %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), {:port_exit, 1}})
+    Process.sleep(20)
+
+    assert [%{attempt: 9, due_in_ms: due_in_ms}] =
+             Orchestrator.snapshot(orchestrator_name, 1_000).retrying
+
+    assert due_in_ms > 0
+    assert due_in_ms <= 12_000
   end
 
   test "status dashboard renders offline marker to terminal" do

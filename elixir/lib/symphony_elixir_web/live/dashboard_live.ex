@@ -92,9 +92,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
-            <p class="metric-label">Blocked</p>
+            <p class="metric-label">Stopped / blocked</p>
             <p class="metric-value numeric"><%= @payload.counts.blocked %></p>
-            <p class="metric-detail">Issues paused for operator input or approval.</p>
+            <p class="metric-detail">Terminal dispatch stops and issues awaiting operator input.</p>
           </article>
 
           <article class="metric-card">
@@ -215,8 +215,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Blocked sessions</h2>
-              <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
+              <h2 class="section-title">Stopped / blocked sessions</h2>
+              <p class="section-copy">Terminal dispatch stops and issues paused for operator input or approval.</p>
             </div>
           </div>
 
@@ -231,6 +231,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>State</th>
                     <th>Session</th>
                     <th>Blocked at</th>
+                    <th>Tokens</th>
                     <th>Last update</th>
                     <th>Error</th>
                   </tr>
@@ -244,8 +245,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td>
-                      <span class={state_badge_class(entry.state || "Blocked")}>
-                        <%= entry.state || "Blocked" %>
+                      <span class={state_badge_class(Map.get(entry, :status) || entry.state || "Blocked")}>
+                        <%= Map.get(entry, :status) || entry.state || "Blocked" %>
                       </span>
                     </td>
                     <td>
@@ -264,6 +265,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <% end %>
                     </td>
                     <td class="mono"><%= entry.blocked_at || "n/a" %></td>
+                    <td class="mono"><%= format_int(Map.get(entry, :codex_total_tokens, 0)) %></td>
                     <td>
                       <div class="detail-stack">
                         <span
